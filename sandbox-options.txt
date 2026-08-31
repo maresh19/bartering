@@ -1,0 +1,106 @@
+VERSION = 1,
+
+option Bartering.EnableSkill = {
+    type = boolean, default = true,
+    page = Bartering, translation = Bartering.EnableSkill,
+}
+
+option Bartering.EnableRelationships = {
+    type = boolean, default = true,
+    page = Bartering, translation = Bartering.EnableRelationships,
+}
+
+option Bartering.BarterValueBonusPerLevel = {
+    type = double, min = 0.00, max = 5.00, default = 0.10,
+    page = Bartering, translation = Bartering.BarterValueBonusPerLevel,
+}
+
+option Bartering.BarterRefreshHours = {
+    type = integer, min = 1, max = 72, default = 6,
+    page = Bartering, translation = Bartering.BarterRefreshHours,
+}
+
+option Bartering.TravelTimeMultiplier = {
+    type = double, min = 0.10, max = 10.00, default = 1.00,
+    page = Bartering, translation = Bartering.RealTimeTravelMultiplier,
+}
+
+option Bartering.RespawnAfterPlayerKill = {
+    type = boolean, default = true,
+    page = Bartering, translation = Bartering.RespawnAfterPlayerKill,
+}
+
+option Bartering.RespawnAfterZombieKill = {
+    type = boolean, default = true,
+    page = Bartering, translation = Bartering.RespawnAfterZombieKill,
+}
+
+option Bartering.RespawnHours = {
+    type = integer, min = 1, max = 168, default = 6,
+    page = Bartering, translation = Bartering.RespawnHours,
+}
+
+option Bartering.RequireMeetingBeforeCalling = {
+    type = boolean, default = true,
+    page = Bartering, translation = Bartering.RequireMeetingBeforeCalling,
+}
+
+option Bartering.ArriveAtCallLocation = {
+    type = enum, numValues=2, default = 1,
+    page = Bartering, translation = Bartering.ArriveAtCallLocation, valueTranslation = Bartering.ArriveAtCallLocation,
+}
+
+option Bartering.Barterer1Weapon = {
+    type = enum, numValues=3, default = 3,
+    page = Bartering, translation = Bartering.Barterer1Weapon, valueTranslation = Bartering.Barterer1Weapon,
+}
+
+option Bartering.Barterer2Weapon = {
+    type = enum, numValues=3, default = 3,
+    page = Bartering, translation = Bartering.Barterer2Weapon, valueTranslation = Bartering.Barterer2Weapon,
+}
+
+option Bartering.Barterer3Weapon = {
+    type = enum, numValues=3, default = 3,
+    page = Bartering, translation = Bartering.Barterer3Weapon, valueTranslation = Bartering.Barterer3Weapon,
+}
+
+option Bartering.Barterer1CallStartHour = {
+    type = integer, min = 0, max = 23, default = 10,
+    page = Bartering, translation = Bartering.Barterer1CallStartHour,
+}
+
+option Bartering.Barterer1CallEndHour = {
+    type = integer, min = 0, max = 23, default = 22,
+    page = Bartering, translation = Bartering.Barterer1CallEndHour,
+}
+
+option Bartering.Barterer2CallStartHour = {
+    type = integer, min = 0, max = 23, default = 10,
+    page = Bartering, translation = Bartering.Barterer2CallStartHour,
+}
+
+option Bartering.Barterer2CallEndHour = {
+    type = integer, min = 0, max = 23, default = 22,
+    page = Bartering, translation = Bartering.Barterer2CallEndHour,
+}
+
+option Bartering.Barterer3CallStartHour = {
+    type = integer, min = 0, max = 23, default = 10,
+    page = Bartering, translation = Bartering.Barterer3CallStartHour,
+}
+
+option Bartering.Barterer3CallEndHour = {
+    type = integer, min = 0, max = 23, default = 22,
+    page = Bartering, translation = Bartering.Barterer3CallEndHour,
+}
+
+option Bartering.QuestCooldownDays = {
+    type = integer, min = 0, max = 60, default = 7,
+    page = Bartering, translation = Bartering.QuestCooldownDays,
+}
+
+option Bartering.DebugMode = {
+    type = boolean, default = false,
+    page = Bartering, translation = Bartering.DebugMode,
+}

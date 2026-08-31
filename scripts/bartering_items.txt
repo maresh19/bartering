@@ -1,0 +1,93 @@
+module Bartering
+{
+    imports
+    {
+        Base
+    }
+
+    item Coupon
+    {
+        DisplayCategory = Junk,
+        Weight	=	0.01,
+        Type	=	Normal,
+        DisplayName	=	Coupon,
+        Icon	=	Paper,
+        WorldStaticModel = EmptyNotebook,
+    }
+
+    item BookBartering1
+	{
+	    DisplayCategory = SkillBook,
+		NumberOfPages	=	220,
+		Weight	=	0.8,
+		Type	=	Literature,
+		DisplayName = Bartering Vol. 1,
+		Icon	=	Book2,
+        SkillTrained = Bartering,
+        LvlSkillTrained = 1,
+        NumLevelsTrained = 2,
+        StaticModel = Book,
+        WorldStaticModel = BookLightBlue_Ground,
+	}
+
+	item BookBartering2
+	{
+	    DisplayCategory = SkillBook,
+		NumberOfPages	=	260,
+		Weight	=	0.8,
+		Type	=	Literature,
+		DisplayName = Bartering Vol. 2,
+		Icon	=	Book2,
+        SkillTrained = Bartering,
+        LvlSkillTrained = 3,
+        NumLevelsTrained = 2,
+        StaticModel = Book,
+        WorldStaticModel = BookLightBlue_Ground,
+	}
+
+    item BookBartering3
+	{
+	    DisplayCategory = SkillBook,
+		NumberOfPages	=	300,
+		Weight	=	0.8,
+		Type	=	Literature,
+		DisplayName = Bartering Vol. 3,
+		Icon	=	Book2,
+        SkillTrained = Bartering,
+        LvlSkillTrained = 5,
+        NumLevelsTrained = 2,
+        StaticModel = Book,
+        WorldStaticModel = BookLightBlue_Ground,
+	}
+
+    item BookBartering4
+	{
+	    DisplayCategory = SkillBook,
+		NumberOfPages	=	340,
+		Weight	=	0.8,
+		Type	=	Literature,
+		DisplayName = Bartering Vol. 4,
+		Icon	=	Book2,
+        SkillTrained = Bartering,
+        LvlSkillTrained = 7,
+        NumLevelsTrained = 2,
+        StaticModel = Book,
+        WorldStaticModel = BookClosedLightBlue_Ground,
+	}
+
+    item BookBartering5
+	{
+	    DisplayCategory = SkillBook,
+		NumberOfPages	=	380,
+		Weight	=	0.8,
+		Type	=	Literature,
+		DisplayName = Bartering Vol. 5,
+		Icon	=	Book2,
+        SkillTrained = Bartering,
+        LvlSkillTrained = 9,
+        NumLevelsTrained = 2,
+        StaticModel = Book,
+        WorldStaticModel = BookClosedLightBlue_Ground,
+    }
+
+}

@@ -1,0 +1,4 @@
+IGUI_EN = {
+	IGUI_perks_Bartering = "Bartering",
+	ContextMenu_Bartering_CallBarterer = "Call in barterer",
+}

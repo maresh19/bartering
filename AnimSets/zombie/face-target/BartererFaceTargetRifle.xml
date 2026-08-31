@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<animNode>
+    <m_Name>BartererFaceTargetRifle</m_Name>
+    <m_AnimName>Bob_IdleRifle</m_AnimName>
+    <m_deferredBoneAxis>Y</m_deferredBoneAxis>
+    <m_Looped>true</m_Looped>
+    <m_SpeedScale>1.04</m_SpeedScale>
+    <m_Conditions>
+        <m_Name>Barterer</m_Name>
+        <m_Type>BOOL</m_Type>
+        <m_BoolValue>true</m_BoolValue>
+    </m_Conditions>
+    <m_Conditions>
+        <m_Name>BartererPrimaryType</m_Name>
+        <m_Type>STRING</m_Type>
+        <m_StringValue>rifle</m_StringValue>
+    </m_Conditions>
+</animNode>
