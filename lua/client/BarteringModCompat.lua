@@ -1,9 +1,10 @@
 require "Bartering"
-require "ISUI/ISSkillProgressBar"
+require "XpSystem/ISUI/ISSkillProgressBar"
 
 local events = _G["Events"]
 local Perks = _G["Perks"]
 local ISSkillProgressBar = _G["ISSkillProgressBar"]
+local print = require("BarteringPathTrace").log
 
 local function getSortedBarterers()
     local barterers = {}
@@ -143,3 +144,11 @@ events.OnGameBoot.Add(registerNecroForgeBarteringPerk)
 events.OnGameBoot.Add(registerDescriptiveSkillTooltipsBartering)
 events.OnGameStart.Add(registerNecroForgeBarteringPerk)
 events.OnGameStart.Add(registerDescriptiveSkillTooltipsBartering)
+
+local BanditCompatibility = _G["BanditCompatibility"]
+if BanditCompatibility then
+    local isRagdoll = BanditCompatibility.IsRagdoll
+    BanditCompatibility.IsRagdoll = function(zombie)
+        return zombie:getVariableBoolean("Barterer") or isRagdoll(zombie)
+    end
+end

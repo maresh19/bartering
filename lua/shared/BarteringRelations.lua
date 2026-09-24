@@ -41,6 +41,13 @@ function Bartering.Relations.reset(player, bartererId)
     player:transmitModData()
 end
 
+function Bartering.Relations.set(player, bartererId, value)
+    local md = player:getModData()
+    md.BarteringRelations = md.BarteringRelations or {}
+    md.BarteringRelations[bartererId] = value > 0 and value or nil
+    player:transmitModData()
+end
+
 function Bartering.Relations.resetAll(bartererId)
     BarteringAIUtils.forEachPlayer(function(player)
         Bartering.Relations.reset(player, bartererId)

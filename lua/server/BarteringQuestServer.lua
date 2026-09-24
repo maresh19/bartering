@@ -8,9 +8,12 @@ local getWorld = _G["getWorld"]
 local getCell = _G["getCell"]
 local getGameTime = _G["getGameTime"]
 local ZombRand = _G["ZombRand"]
-local InventoryItemFactory = _G["InventoryItemFactory"]
+local instanceItem = _G["instanceItem"]
 local sendServerCommand = _G["sendServerCommand"]
+local sendAddItemToContainer = _G["sendAddItemToContainer"]
+local sendRemoveItemFromContainer = _G["sendRemoveItemFromContainer"]
 local BarteringAIUtils = require "BarteringAIUtils"
+local print = require("BarteringPathTrace").log
 local ArrayList = _G["ArrayList"]
 
 local PLACEMENT_TICK_INTERVAL = 30
@@ -31,13 +34,16 @@ local function getCandidateTowns(barterer)
     return candidates
 end
 
-local function pickPersonalRoom(buildingDef)
+local function isPersonalRoomDef(roomDef)
+    return Bartering.Quests.isPersonalRoom(roomDef:getName())
+end
+
+local function pickMatchingRoom(buildingDef, matches)
     local rooms = buildingDef:getRooms()
     local candidates = {}
     for i = 0, rooms:size() - 1 do
         local roomDef = rooms:get(i)
-        if Bartering.Quests.isUsableRoom(roomDef)
-                and Bartering.Quests.isPersonalRoom(roomDef:getName()) then
+        if Bartering.Quests.isUsableRoom(roomDef) and matches(roomDef) then
             table.insert(candidates, roomDef)
         end
     end
@@ -89,11 +95,11 @@ local function getTownNamedLocations(townId)
     return named
 end
 
-local function namedForTile(townId, buildingDef, x, y)
+local function namedForTile(townId, buildingDef, x, y, level)
     local metaGrid = getWorld():getMetaGrid()
     local best, bestDist
     for _, location in ipairs(Bartering.NamedPlaces.getLocations()) do
-        if location.townId == townId and buildingDef
+        if location.townId == townId and (location.z or 0) == level and buildingDef
                 and metaGrid:getBuildingAt(location.x, location.y) == buildingDef then
             local dist = math.abs(location.x - x) + math.abs(location.y - y)
             if not bestDist or dist < bestDist then
@@ -103,7 +109,7 @@ local function namedForTile(townId, buildingDef, x, y)
     end
     if not best then
         for _, location in ipairs(Bartering.NamedPlaces.getLocations()) do
-            if location.townId == townId then
+            if location.townId == townId and (location.z or 0) == level then
                 local dx = math.abs(location.x - x)
                 local dy = math.abs(location.y - y)
                 if dx <= location.radius and dy <= location.radius then
@@ -127,12 +133,12 @@ local function findNamedRoom(town, themed)
             local rooms = buildingDef:getRooms()
             for i = 0, rooms:size() - 1 do
                 local roomDef = rooms:get(i)
-                if Bartering.Quests.isUsableRoom(roomDef) then
+                if location.z == roomDef:getZ() and Bartering.Quests.isUsableRoom(roomDef) then
                     local tileX, tileY = pickRoomTile(metaGrid, roomDef)
                     if tileX then
                         if themed and Bartering.Quests.getThemeForRoom(roomDef:getName()) then
-                            return buildingDef, roomDef, tileX, tileY, namedForTile(town.id, buildingDef, tileX, tileY)
-                        elseif not fallback then
+                            return buildingDef, roomDef, tileX, tileY, namedForTile(town.id, buildingDef, tileX, tileY, roomDef:getZ())
+                        elseif not themed and not fallback then
                             fallback = { buildingDef, roomDef, tileX, tileY }
                         end
                     end
@@ -141,19 +147,19 @@ local function findNamedRoom(town, themed)
         end
     end
     if fallback then
-        return fallback[1], fallback[2], fallback[3], fallback[4], namedForTile(town.id, fallback[1], fallback[3], fallback[4])
+        return fallback[1], fallback[2], fallback[3], fallback[4], namedForTile(town.id, fallback[1], fallback[3], fallback[4], fallback[2]:getZ())
     end
     return nil, nil, nil, nil, nil
 end
 
-local function findPersonalRoom(town)
+local function findMatchingRoom(town, matches)
     local metaGrid = getWorld():getMetaGrid()
     local spanX = town.x2 - town.x1 + 1
     local spanY = town.y2 - town.y1 + 1
     for _ = 1, Bartering.Quests.BUILDING_SAMPLES do
         local buildingDef = metaGrid:getBuildingAt(town.x1 + ZombRand(spanX), town.y1 + ZombRand(spanY))
         if buildingDef then
-            local roomDef = pickPersonalRoom(buildingDef)
+            local roomDef = pickMatchingRoom(buildingDef, matches)
             if roomDef then
                 local tileX, tileY = pickRoomTile(metaGrid, roomDef)
                 if tileX then
@@ -174,15 +180,30 @@ function BarteringQuestServer.generate(player, bartererId)
     local candidates = getCandidateTowns(barterer)
     local town, buildingDef, roomDef, tileX, tileY, questNamedLoc
     local chosenStrategy
+    local presetTheme
+    if Bartering.Quests.isClothingQuestAvailable(bartererId)
+            and ZombRand(100) < Bartering.Quests.CLOTHING_QUEST_CHANCE then
+        for _, candidate in ipairs(candidates) do
+            local building, room, xor, yor = findMatchingRoom(candidate, Bartering.Quests.isClothingRoom)
+            if room then
+                buildingDef, roomDef, tileX, tileY = building, room, xor, yor
+                town = candidate
+                presetTheme = "clothing"
+                break
+            end
+        end
+    end
     local strategies
-    if ZombRand(10) < 2 then
+    local hasOldPlace = not Bartering.Quests.hasNecklaceUsed(player, bartererId)
+    local r = ZombRand(10)
+    if hasOldPlace and r < 2 then
         strategies = { "old", "generic", "themed" }
-    elseif ZombRand(2) == 0 then
+    elseif r < 5 then
         strategies = { "themed", "generic", "old" }
     else
         strategies = { "generic", "themed", "old" }
     end
-    for _, strategy in ipairs(strategies) do
+    for _, strategy in ipairs(presetTheme and {} or strategies) do
         for _, candidate in ipairs(candidates) do
             local building, room, xor, yor, namedLoc
             if strategy == "themed" then
@@ -190,7 +211,7 @@ function BarteringQuestServer.generate(player, bartererId)
             elseif strategy == "generic" then
                 building, room, xor, yor, namedLoc = findNamedRoom(candidate, false)
             else
-                building, room, xor, yor, namedLoc = findPersonalRoom(candidate)
+                building, room, xor, yor, namedLoc = findMatchingRoom(candidate, isPersonalRoomDef)
             end
             if room then
                 buildingDef, roomDef, tileX, tileY, questNamedLoc = building, room, xor, yor, namedLoc
@@ -209,11 +230,58 @@ function BarteringQuestServer.generate(player, bartererId)
         return
     end
 
-    local theme = Bartering.Quests.getThemeForRoom(roomDef:getName())
-    if not theme and chosenStrategy == "themed" then
-        theme = ZombRand(2) == 0 and "video" or "music"
+    local theme = presetTheme or Bartering.Quests.getThemeForRoom(roomDef:getName())
+    if not theme and chosenStrategy == "old" then
+        if not Bartering.Quests.hasNecklaceUsed(player, bartererId) then
+            theme = ZombRand(2) == 0 and "necklace" or "picture"
+        end
     end
-    local itemType, itemLabel, itemName, title, complaint
+    if theme == "medicine" and not questNamedLoc then
+        for _, candidate in ipairs(candidates) do
+            local building, room, xor, yor, namedLoc = findNamedRoom(candidate, true)
+            if room and namedLoc then
+                buildingDef, roomDef, tileX, tileY, questNamedLoc = building, room, xor, yor, namedLoc
+                town = candidate
+                break
+            end
+        end
+        if not questNamedLoc then
+            print("[Bartering][Quest] medicine quest skipped - no named medical room found")
+            return
+        end
+    end
+    local buildingContext
+    if theme == "medicine" and roomDef:getName() == Bartering.Quests.MedicineStorageRoom then
+        local rooms = buildingDef:getRooms()
+        for i = 0, rooms:size() - 1 do
+            local kind = Bartering.Quests.BuildingRoomSignatures[rooms:get(i):getName()]
+            if kind then
+                buildingContext = kind
+                break
+            end
+        end
+        if not buildingContext and questNamedLoc then
+            buildingContext = Bartering.Quests.getBuildingKindFromName(questNamedLoc.name)
+            if buildingContext then
+                local roomNames = {}
+                local rooms = buildingDef:getRooms()
+                for i = 0, rooms:size() - 1 do
+                    local name = rooms:get(i):getName()
+                    if not roomNames[name] then
+                        roomNames[name] = true
+                    end
+                end
+                local roomList = {}
+                for name in pairs(roomNames) do
+                    table.insert(roomList, name)
+                end
+                table.sort(roomList)
+                print(string.format("[Bartering][Quest] medicine context '%s' inferred from '%s' (%s)",
+                    buildingContext, questNamedLoc.name, table.concat(roomList, ",")))
+            end
+        end
+    end
+    local itemType, itemLabel, itemName, title, complaint, pictureTie
     if theme == "video" then
         title = Bartering.pickRandomListItem(Bartering.Quests.VideoTitles)
         itemType = "Base.VHS_Retail"
@@ -234,6 +302,22 @@ function BarteringQuestServer.generate(player, bartererId)
         itemLabel = med.itemName
         itemName = med.itemName
         complaint = med.complaint
+    elseif theme == "clothing" then
+        local clothing = Bartering.pickRandomListItem(Bartering.Quests.ClothingItems)
+        itemType = clothing.itemType
+        itemLabel = clothing.label
+        itemName = Bartering.Quests.buildItemName(bartererId, itemLabel)
+    elseif theme == "necklace" then
+        itemType = Bartering.pickRandomListItem(Bartering.Quests.NecklaceItems)
+        local tie = Bartering.pickRandomListItem(Bartering.Quests.NecklaceTies)
+        itemLabel = Bartering.Quests.NecklaceTieLabels[tie]
+        itemName = Bartering.Quests.buildItemName(bartererId, itemLabel)
+    elseif theme == "picture" then
+        local pic = Bartering.pickRandomListItem(Bartering.Quests.PictureItems)
+        itemType = pic.itemType
+        itemLabel = "Picture of " .. Bartering.getBartererDisplayName(bartererId) .. "'s " .. pic.familyTie
+        itemName = itemLabel
+        pictureTie = pic.familyTie
     else
         local excludeTools = not Bartering.Quests.isPersonalRoom(roomDef:getName())
         itemType = Bartering.pickRandomListItem(Bartering.Quests.getRequestableItems(excludeTools))
@@ -258,11 +342,13 @@ function BarteringQuestServer.generate(player, bartererId)
         theme = theme,
         title = title,
         complaint = complaint,
+        pictureTie = pictureTie,
         townId = town.id,
         townName = town.name,
         roomName = roomDef:getName(),
         namedId = questNamedLoc and questNamedLoc.id,
         namedFloor0Room = namedFloor0Room,
+        buildingContext = buildingContext,
         x = tileX,
         y = tileY,
         z = roomDef:getZ(),
@@ -278,13 +364,14 @@ function BarteringQuestServer.generate(player, bartererId)
     player:transmitModData()
 
     print(string.format("[Bartering][Quest] %s -> %s in %s (%s) at %d,%d,%d",
-        Bartering.getBartererDisplayName(bartererId), quest.itemName, quest.townName, quest.roomName,
+        Bartering.getBartererDisplayName(bartererId), quest.itemName, quest.townName,
+        quest.buildingContext and Bartering.Quests.getPlaceReference(quest, nil) or quest.roomName,
         quest.x, quest.y, quest.z))
 
     sendServerCommand(player, "Bartering", "questUpdated", { bartererId = bartererId })
 end
 
-local function pickRoomContainer(room)
+local function getRoomContainers(room)
     local containers = {}
     local squares = room:getSquares()
     for i = 0, squares:size() - 1 do
@@ -296,7 +383,7 @@ local function pickRoomContainer(room)
             end
         end
     end
-    return Bartering.pickRandomListItem(containers)
+    return containers
 end
 
 local function placeQuestItem(quest)
@@ -305,14 +392,15 @@ local function placeQuestItem(quest)
         return false
     end
 
-    local item = InventoryItemFactory.CreateItem(quest.itemType)
+    local item = instanceItem(quest.itemType)
     item:setName(quest.itemName)
     item:getModData().BarteringQuestId = quest.id
     item:getModData().BarteringQuestBarterer = quest.bartererId
 
-    local container = pickRoomContainer(square:getRoom())
+    local container = Bartering.pickRandomListItem(getRoomContainers(square:getRoom()))
     if container then
         container:AddItem(item)
+        sendAddItemToContainer(container, item)
     else
         square:AddWorldInventoryItem(item, 0.5, 0.5, 0)
     end
@@ -327,19 +415,13 @@ local function removeQuestItem(player, quest)
     if square then
         local room = square:getRoom()
         if room then
-            local squares = room:getSquares()
-            for i = 0, squares:size() - 1 do
-                local objects = squares:get(i):getObjects()
-                for j = 0, objects:size() - 1 do
-                    local container = objects:get(j):getContainer()
-                    if container then
-                        local items = container:getItems()
-                        for k = items:size() - 1, 0, -1 do
-                            local item = items:get(k)
-                            if item:getModData().BarteringQuestId == quest.id then
-                                container:Remove(item)
-                            end
-                        end
+            for _, container in ipairs(getRoomContainers(room)) do
+                local items = container:getItems()
+                for k = items:size() - 1, 0, -1 do
+                    local item = items:get(k)
+                    if item:getModData().BarteringQuestId == quest.id then
+                        container:Remove(item)
+                        sendRemoveItemFromContainer(container, item)
                     end
                 end
             end
@@ -350,7 +432,9 @@ local function removeQuestItem(player, quest)
         ArrayList.new())
     for i = 0, held:size() - 1 do
         local item = held:get(i)
-        item:getContainer():Remove(item)
+        local container = item:getContainer()
+        container:Remove(item)
+        sendRemoveItemFromContainer(container, item)
     end
 end
 
@@ -362,14 +446,22 @@ local function onTick()
     placementTicks = 0
 
     BarteringAIUtils.forEachPlayer(function(player)
-        local placedAny = false
-        for _, quest in pairs(Bartering.Quests.getPlayerState(player).active) do
-            if not quest.placed and placeQuestItem(quest) then
+        local state = Bartering.Quests.getPlayerState(player)
+        local changed = false
+        for bartererId, quest in pairs(state.active) do
+            if Bartering.Quests.isExpired(quest) then
+                removeQuestItem(player, quest)
+                state.active[bartererId] = nil
+                changed = true
+                print(string.format("[Bartering][Quest] %s expired for %s",
+                    quest.itemName, Bartering.getBartererDisplayName(bartererId)))
+                sendServerCommand(player, "Bartering", "questUpdated", { bartererId = bartererId })
+            elseif not quest.placed and placeQuestItem(quest) then
                 quest.placed = true
-                placedAny = true
+                changed = true
             end
         end
-        if placedAny then
+        if changed then
             player:transmitModData()
         end
     end)
@@ -377,7 +469,7 @@ end
 
 function BarteringQuestServer.turnIn(player, bartererId)
     local state = Bartering.Quests.getPlayerState(player)
-    local quest = state.active[bartererId]
+    local quest = Bartering.Quests.getActive(player, bartererId)
     if not quest then
         return
     end
@@ -387,10 +479,30 @@ function BarteringQuestServer.turnIn(player, bartererId)
         return
     end
 
-    item:getContainer():Remove(item)
+    if player:isEquippedClothing(item) then
+        player:removeWornItem(item)
+        triggerEvent("OnClothingUpdated", player)
+    end
+    local itemContainer = item:getContainer()
+    itemContainer:Remove(item)
+    sendRemoveItemFromContainer(itemContainer, item)
+    if quest.theme == "clothing" then
+        local visual = Bartering.captureClothingVisual(item)
+        local replacedType = Bartering.giveBartererQuestClothing(bartererId, quest.itemType, visual)
+        local queued = BarteringAI.queueClothingChange(bartererId, quest.itemType, replacedType)
+        print(string.format("[Bartering][Quest] %s will wear %s (replaced=%s liveZombie=%s textureChoice=%d baseTexture=%d tint=%.2f,%.2f,%.2f)",
+            Bartering.getBartererDisplayName(bartererId), quest.itemType,
+            tostring(replacedType), tostring(queued), visual.textureChoice, visual.baseTexture,
+            visual.tint.r, visual.tint.g, visual.tint.b))
+    end
     Bartering.Relations.add(player, bartererId, Bartering.Quests.REWARD)
-    player:getInventory():AddItem(Bartering.Quests.createCoupon(bartererId))
+    local coupon = player:getInventory():AddItem(Bartering.Quests.createCoupon(bartererId))
+    sendAddItemToContainer(player:getInventory(), coupon)
     state.active[bartererId] = nil
+    if quest.theme == "necklace" or quest.theme == "picture" then
+        state.necklaceUsed = state.necklaceUsed or {}
+        state.necklaceUsed[bartererId] = true
+    end
     Bartering.Quests.startCooldown(player, bartererId)
     player:transmitModData()
 
@@ -420,6 +532,8 @@ function BarteringQuestServer.debugRefreshQuest(player, bartererId)
     BarteringQuestServer.generate(player, bartererId)
 end
 
-events.OnTick.Add(onTick)
+if not isClient() then
+    events.OnTick.Add(onTick)
+end
 
 return BarteringQuestServer

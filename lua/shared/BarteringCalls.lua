@@ -7,19 +7,22 @@ local getCell = _G["getCell"]
 local ModData = _G["ModData"]
 local BarteringAIUtils = require "BarteringAIUtils"
 local BarteringTiming = require "BarteringTiming"
+local BarteringIntercept = require "Movement/BarteringIntercept"
+local BarteringDialogue = require "BarteringDialogue"
+local BarteringHire = require "BarteringHire"
+local BarteringReturn = require "Movement/BarteringReturn"
+local print = require("BarteringPathTrace").log
 local CALL_REGISTRY = Bartering.Registries.Call
-local ACTIVE_CALLED_IN_REGISTRY = Bartering.Registries.ActiveCalledIn
 local RETURNING_HOME_REGISTRY = Bartering.Registries.ReturningHome
 
 local pendingCalls = {}
 local calledInCleanups = {}
 local callRegistryInitialized = false
 
-local ACTIVE_CALLED_IN_PERSIST_TICKS = 20
 local CALLED_IN_CLEANUP_WINDOW_MS = 8000
-local RETURN_OUT_OF_SIGHT_GRACE_MS = 5000
+local CALL_PROGRESS_PERSIST_MS = 2000
 local CALLED_IN_CLEANUP_RADIUS_SQ = 4
-local CALLED_IN_LIFETIME_HOURS = BarteringTiming.CALLED_IN_LIFETIME_HOURS
+local MEETUP_WAIT_HOLD_MS = BarteringTiming.CALLED_IN_LIFETIME_MS
 
 function Bartering.getBartererCallWindowHours(bartererId)
     local idSuffix = tostring(bartererId or "")
@@ -28,27 +31,81 @@ function Bartering.getBartererCallWindowHours(bartererId)
     return startHour, endHour
 end
 
-function Bartering.isBartererCallOpenNow(bartererId)
+function Bartering.isBartererCallOpenIn(bartererId, seconds)
+    if Bartering.getSandboxBoolean("DebugMode", false) then
+        return true
+    end
+
     local startHour, endHour = Bartering.getBartererCallWindowHours(bartererId)
-    local currentHour = getGameTime():getTimeOfDay()
+    local hour = (getGameTime():getTimeOfDay() + seconds / BarteringTiming.realSecondsPerGameHour()) % 24
 
     if startHour == endHour then
         return true
     end
 
     if startHour < endHour then
-        return currentHour >= startHour and currentHour < endHour
+        return hour >= startHour and hour < endHour
     end
 
-    return currentHour >= startHour or currentHour < endHour
+    return hour >= startHour or hour < endHour
+end
+
+function Bartering.isBartererCallOpenNow(bartererId)
+    return Bartering.isBartererCallOpenIn(bartererId, 0)
+end
+
+function Bartering.areCallWindowsIdentical()
+    local firstStart, firstEnd
+    for bartererId in pairs(Bartering.Barterers) do
+        local s, e = Bartering.getBartererCallWindowHours(bartererId)
+        if not firstStart then
+            firstStart, firstEnd = s, e
+        elseif s ~= firstStart or e ~= firstEnd then
+            return false
+        end
+    end
+    return true
+end
+
+function Bartering.getCallBlockReason(player, bartererId, formatHours)
+    local hostile = Bartering.Hostility.isHostileTo(bartererId, player)
+    local known = Bartering.isBartererKnown(player, bartererId)
+    if Bartering.getSandboxBoolean("EnableRelationships", true)
+        and Bartering.Relations.getStarCount(player, bartererId) < SandboxVars.Bartering.CallRelationshipStars and not hostile then
+        local blocked = string.format(BarteringDialogue.Blocked.relationshipTooLow, SandboxVars.Bartering.CallRelationshipStars)
+        if not known then
+            return blocked .. ". Also requires meeting in person"
+        end
+        return blocked
+    end
+    if not known then
+        return "Meet this barterer in person before radio calls are unlocked"
+    end
+
+    local displayName = Bartering.getBartererDisplayName(bartererId)
+    if not Bartering.isBartererDeathHidden(bartererId) then
+        if Bartering.isBartererPermanentlyDead(bartererId) then
+            return displayName .. " is dead and cannot respawn with the current sandbox settings"
+        end
+        local respawnHours = BarteringTiming.remainingHours(Bartering.getBartererLifeState(bartererId).respawnAt)
+        if respawnHours > 0 then
+            return displayName .. " is dead and will be replaced with a new barterer in " .. formatHours(respawnHours)
+        end
+    end
+    return nil
 end
 
 local BarteringCalls = {}
 
 function BarteringCalls.new(config)
     local state = config.state
+    local intercept
+    local returnLogic
 
     local function sendToClient(player, command, args)
+        if not player then
+            return
+        end
         if isServer() then
             sendServerCommand(player, "Bartering", command, args)
             return
@@ -64,16 +121,19 @@ function BarteringCalls.new(config)
         })
     end
 
-    local function setBartererETA(player, bartererId, arrivalAtMs, calledOut, startX, startY, targetX, targetY, startedAtMs)
+    local function setBartererETA(player, bartererId, arrivalAtMs, calledOut, startX, startY, targetX, targetY, startedAtMs, waiting)
+        local now = BarteringTiming.now()
+        local arrival = arrivalAtMs or 0
         sendToClient(player, "setBartererETA", {
             bartererId = bartererId,
-            arrivalAtMs = arrivalAtMs or 0,
+            remainingMs = arrival > 0 and math.max(1, arrival - now) or 0,
+            elapsedMs = startedAtMs and math.max(0, now - startedAtMs) or 0,
             calledOut = calledOut == true,
             startX = startX,
             startY = startY,
             targetX = targetX,
             targetY = targetY,
-            startedAtMs = startedAtMs,
+            waiting = waiting == true,
         })
     end
 
@@ -81,37 +141,42 @@ function BarteringCalls.new(config)
         setBartererETA(player, bartererId, 0, false)
     end
 
-    local ZONE_SCAN_RADIUS = 20
+    local ZONE_SCAN_RADIUS_SQ = 20 * 20
     local ZONE_SCAN_MAX_ZOMBIES = 30
     local GRACE_PERIOD_MS = 120000
 
-    local function countZombiesInRadius(x, y, z, radius)
-        local count = 0
-        local zombies = getCell():getZombieList()
-        local radiusSq = radius * radius
-        for i = 0, zombies:size() - 1 do
-            local zombie = zombies:get(i)
-            if math.floor(zombie:getZ()) == math.floor(z)
-                and BarteringAIUtils.distanceSq(zombie:getX(), zombie:getY(), x, y) <= radiusSq then
-                count = count + 1
+    local function getCallTargetLocation(player)
+        local targetX = math.floor(player:getX())
+        local targetY = math.floor(player:getY())
+        local targetZ = player:getZ()
+
+        for bartererId, record in pairs(Bartering.getLiveRecords()) do
+            local zombie = state.serverZombies[bartererId]
+            if zombie and record.state == "BlockedByDoor" then
+                local baseX = math.floor(zombie:getX())
+                local baseY = math.floor(zombie:getY())
+                local offsets = {
+                    { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+                    { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 },
+                }
+                for _, offset in ipairs(offsets) do
+                    local square = getCell():getGridSquare(baseX + offset[1], baseY + offset[2], zombie:getZ())
+                    if square and square:isFree(false) then
+                        return baseX + offset[1], baseY + offset[2], zombie:getZ()
+                    end
+                end
             end
         end
-        return count
+
+        return targetX, targetY, targetZ
     end
 
-    local function getCallTargetLocation(player)
-        return math.floor(player:getX()), math.floor(player:getY()), player:getZ()
-    end
+    local function pendingCallPosition(call)
+        call.startX = call.startX or call.barterer.x
+        call.startY = call.startY or call.barterer.y
 
-    local function getCallTravelSecondsToLocation(barterer, targetX, targetY)
-        return BarteringTiming.calculateTravelSeconds(
-            targetX,
-            targetY,
-            barterer.x,
-            barterer.y,
-            barterer.travelSecondsPerTile,
-            Bartering.getSandboxNumber("TravelTimeMultiplier", 1)
-        )
+        return Bartering.RoadRoute.positionFor(call,
+            BarteringTiming.progress(call.startedAtMs, call.arrivalAtMs))
     end
 
     local function setPendingCall(bartererId, player, barterer, startedAtMs, targetX, targetY, targetZ, arrivalModeLocation, arrivalAtMs)
@@ -124,7 +189,35 @@ function BarteringCalls.new(config)
             targetZ = targetZ,
             arrivalModeLocation = arrivalModeLocation == true,
             arrivalAtMs = arrivalAtMs,
+            standoff = Bartering.RoadRoute.ARRIVAL_STANDOFF,
         }
+        print(string.format(
+            "[Bartering][Call] %s registered | arrivalInMs=%s target=%s,%s mode=%s",
+            tostring(bartererId), tostring((arrivalAtMs or 0) - BarteringTiming.now()),
+            tostring(targetX), tostring(targetY), tostring(arrivalModeLocation == true)))
+    end
+
+    local function consumePendingCall(bartererId)
+        pendingCalls[bartererId] = nil
+        Bartering.setRegistryRecord(CALL_REGISTRY, bartererId, nil)
+    end
+
+    local function persistCallProgress(bartererId, call, now, x, y)
+        if now - (call.persistedAtMs or 0) < CALL_PROGRESS_PERSIST_MS then
+            return
+        end
+        call.persistedAtMs = now
+
+        local record = Bartering.getRegistryRecord(CALL_REGISTRY, bartererId)
+        if not record then
+            return
+        end
+
+        record.remainingMs = math.max(0, call.arrivalAtMs - now)
+        if x then
+            record.startX = x
+            record.startY = y
+        end
     end
 
     local function bootstrapPersistedCalls()
@@ -132,30 +225,103 @@ function BarteringCalls.new(config)
             return
         end
 
+        local now = BarteringTiming.now()
         for bartererId, record in pairs(ModData.getOrCreate(CALL_REGISTRY)) do
             if record and record.barterer and not pendingCalls[bartererId] then
-                setPendingCall(bartererId, config.resolvePlayerFromRecord(record), record.barterer, record.startedAtMs,
-                    record.targetX, record.targetY, record.targetZ, record.arrivalModeLocation, record.arrivalAtMs)
+                local startedAtMs = record.startedAtMs
+                local arrivalAtMs = record.arrivalAtMs
+                if record.remainingMs then
+                    startedAtMs = now
+                    arrivalAtMs = now + record.remainingMs
+                end
+
+                setPendingCall(bartererId, config.resolvePlayerFromRecord(record), record.barterer, startedAtMs,
+                    record.targetX, record.targetY, record.targetZ, record.arrivalModeLocation, arrivalAtMs)
+
+                local call = pendingCalls[bartererId]
+                call.startX = record.startX
+                call.startY = record.startY
+                if record.waitingAtMeetup then
+                    call.waitingAtMeetup = true
+                end
+
+                print(string.format(
+                    "[Bartering][Call] restored %s with %.0fs of travel left from %s,%s",
+                    tostring(bartererId), (arrivalAtMs - now) / 1000,
+                    tostring(record.startX), tostring(record.startY)))
             end
         end
+
+        returnLogic.restoreReturningHome(now)
 
         callRegistryInitialized = true
     end
 
     local function hasCalledInEntry(bartererId)
-        for _, entry in ipairs(state.barterers) do
-            if entry.bartererId == bartererId and not entry.homeResident then
-                return true
+        local record = Bartering.getLiveRecord(bartererId)
+        return record ~= nil and not record.homeResident
+    end
+
+    local function homewardPosition(bartererId)
+        local live = Bartering.getLiveRecord(bartererId)
+        if live and not live.homeResident then
+            if live.returningAfterMeeting then
+                return live.x, live.y
             end
+            return nil
         end
-        return false
+        local trip = Bartering.getRegistryRecord(RETURNING_HOME_REGISTRY, bartererId)
+        if not trip then
+            return nil
+        end
+        local left = math.max(0, trip.arriveHomeAtMs - BarteringTiming.now()) / trip.totalMs
+        return trip.homeX + (trip.fromX - trip.homeX) * left, trip.homeY + (trip.fromY - trip.homeY) * left
+    end
+
+    local function otherMeetupEtaSeconds(player, bartererId)
+        local call = pendingCalls[bartererId]
+        if call then
+            if call.player == player or call.waitingAtMeetup then
+                return nil
+            end
+            return math.max(0, (call.arrivalAtMs - BarteringTiming.now()) / 1000)
+        end
+        local live = Bartering.getLiveRecord(bartererId)
+        if not live or live.homeResident or live.returningAfterMeeting or live.hasArrived
+            or live.master == player:getUsername() then
+            return nil
+        end
+        local targetX, targetY = live.approachTargetX, live.approachTargetY
+        if not targetX then
+            local master = Bartering.findOnlinePlayer(live.master)
+            targetX, targetY = master:getX(), master:getY()
+        end
+        return BarteringTiming.travelSeconds(live.x, live.y, targetX, targetY,
+            Bartering.Barterers[bartererId].travelSecondsPerTile)
+    end
+
+    local function radioStatus(player, bartererId)
+        local status, seconds
+        local call = pendingCalls[bartererId]
+        local live = Bartering.getLiveRecord(bartererId)
+        if call then
+            if call.player ~= player then
+                status = call.waitingAtMeetup and "waiting" or "meetup"
+                seconds = math.max(0, (call.arrivalAtMs - BarteringTiming.now()) / 1000)
+            end
+        elseif homewardPosition(bartererId) then
+            status = "home"
+        elseif live and not live.homeResident and live.master ~= player:getUsername() then
+            status = live.hasArrived and "waiting" or "meetup"
+            seconds = live.hasArrived and Bartering.getBartererDepartureRemainingSeconds(bartererId) or nil
+        end
+        sendToClient(player, "radioStatus", { bartererId = bartererId, status = status, seconds = seconds })
     end
 
     local function buildCallRecord(player, barterer, startedAtMs, targetX, targetY, targetZ, arrivalModeLocation, arrivalAtMs)
         return {
             barterer = barterer,
             playerName = player:getUsername(),
-            playerOnlineId = player:getOnlineID(),
             startedAtMs = startedAtMs,
             targetX = targetX,
             targetY = targetY,
@@ -165,78 +331,125 @@ function BarteringCalls.new(config)
         }
     end
 
-    local function refuseCall(player, bartererId, reason, clearEta)
+    local function refuseCall(player, bartererId, reason, clearEta, template, live)
         if clearEta then
             clearBartererETA(player, bartererId)
         end
         sendToClient(player, "callRefused", {
             bartererId = bartererId,
             reason = reason,
+            template = template,
+            live = live,
         })
     end
 
     local function callBarterer(player, bartererId)
         local barterer = Bartering.Barterers[bartererId]
         local lifeState = Bartering.getBartererLifeState(bartererId)
+        if Bartering.isBartererDeathHidden(bartererId) then
+            lifeState.deathDiscovered = true
+            Bartering.markBartererDataDirty(bartererId)
+            clearBartererETA(player, bartererId)
+            sendToClient(player, "callNoAnswer", {
+                bartererId = bartererId,
+                message = BarteringDialogue.Call.noAnswer,
+            })
+            return
+        end
         local respawnRemainingHours = BarteringTiming.remainingHours(lifeState.respawnAt)
         if respawnRemainingHours > 0 then
-            refuseCall(player, bartererId, "I'm laid up right now and won't be back in "
-                .. BarteringTiming.formatDuration(respawnRemainingHours * 3600), true)
+            refuseCall(player, bartererId,
+                string.format(BarteringDialogue.Call.injured, BarteringTiming.formatDurationHours(respawnRemainingHours)), true,
+                "injured", "respawn")
             return
         end
         if Bartering.isBartererPermanentlyDead(bartererId) then
-            refuseCall(player, bartererId, "This channel's dead, buddy. Nothing's picking up.", true)
+            refuseCall(player, bartererId, BarteringDialogue.Call.permanentlyDead, true)
+            return
+        end
+        if BarteringHire.isHired(bartererId) and not BarteringHire.isHiredBy(player, bartererId) then
+            refuseCall(player, bartererId, BarteringDialogue.Hire.workingRefusal, true, "working", nil)
+            return
+        end
+        local otherEta = otherMeetupEtaSeconds(player, bartererId)
+        if otherEta then
+            local backIn = otherEta + BarteringTiming.CALLED_IN_LIFETIME_MS / 1000
+            if Bartering.isBartererCallOpenIn(bartererId, backIn) then
+                refuseCall(player, bartererId, string.format(BarteringDialogue.Call.otherMeetup,
+                    BarteringTiming.formatArrivalEstimateHumanized(backIn)), true)
+            else
+                refuseCall(player, bartererId, BarteringDialogue.Call.tooLateAfterMeetup, true)
+            end
             return
         end
         local pending = pendingCalls[bartererId]
         if pending then
-            local etaSeconds = math.max(0, (pending.arrivalAtMs - getTimeInMillis()) / 1000)
-            refuseCall(player, bartererId, "I'm already on my way. I'll be there in "
-                .. BarteringTiming.formatDuration(etaSeconds))
+            local etaSeconds = math.max(0, (pending.arrivalAtMs - BarteringTiming.now()) / 1000)
+            refuseCall(player, bartererId,
+                string.format(BarteringDialogue.Call.alreadyEnRoute, BarteringTiming.formatDuration(etaSeconds)), false,
+                "alreadyEnRoute", "eta")
             return
         end
-        if Bartering.Relations.getStarCount(player, bartererId) < 1 then
-            refuseCall(player, bartererId, "I don't know you well enough for radio calls", true)
+        if Bartering.getSandboxBoolean("EnableRelationships", true)
+            and not Bartering.Hostility.isHostileTo(bartererId, player)
+            and Bartering.Relations.getStarCount(player, bartererId) < SandboxVars.Bartering.CallRelationshipStars then
+            refuseCall(player, bartererId, BarteringDialogue.Call.relationshipTooLow, true)
             return
         end
         if not Bartering.isBartererCallOpenNow(bartererId) then
-            local callStartHour, callEndHour = Bartering.getBartererCallWindowHours(bartererId)
-            refuseCall(player, bartererId, string.format("%s only answers between %02d:00 and %02d:00",
-                Bartering.getBartererDisplayName(bartererId), callStartHour, callEndHour), true)
+            if homewardPosition(bartererId) then
+                refuseCall(player, bartererId, BarteringDialogue.Call.tooLateHeadingHome, true)
+            else
+                refuseCall(player, bartererId, BarteringDialogue.Call.sleepingNoAnswer, true, "sleeping", nil)
+            end
             return
         end
 
         if not Bartering.isBartererKnown(player, bartererId) then
-            refuseCall(player, bartererId, "Who is this? We ain't met. Come see me face to face.", true)
+            refuseCall(player, bartererId, BarteringDialogue.Call.strangerOnRadio, true)
             return
         end
 
-        if hasCalledInEntry(bartererId) then
-            refuseCall(player, bartererId, "I'm already here, ain't I?", true)
+        local fromX, fromY = homewardPosition(bartererId)
+        if not fromX and hasCalledInEntry(bartererId) then
+            refuseCall(player, bartererId, BarteringDialogue.Call.alreadyHere, true)
             return
         end
 
+        if fromX then
+            lifeState.returningHomeAt = nil
+            Bartering.markBartererDataDirty(bartererId)
+            Bartering.clearReturningHomeKnowledge(bartererId)
+        else
+            fromX, fromY = barterer.x, barterer.y
+        end
         Bartering.setRegistryRecord(RETURNING_HOME_REGISTRY, bartererId, nil)
 
         local playerX, playerY, playerZ = getCallTargetLocation(player)
-        if countZombiesInRadius(playerX, playerY, playerZ, ZONE_SCAN_RADIUS) > ZONE_SCAN_MAX_ZOMBIES then
-            refuseCall(player, bartererId, "Last I heard that area was way too infested, sorry buddy", true)
+        if BarteringAIUtils.countZombiesNear(playerX, playerY, playerZ, ZONE_SCAN_RADIUS_SQ) > ZONE_SCAN_MAX_ZOMBIES then
+            refuseCall(player, bartererId, BarteringDialogue.Call.areaInfested, true)
             return
         end
         config.despawnBarterer(bartererId)
 
         local arriveAtCallLocation = Bartering.getSandboxNumber("ArriveAtCallLocation", 1) == 1
         local targetX, targetY, targetZ = playerX, playerY, playerZ
-        local travelSeconds = getCallTravelSecondsToLocation(barterer, targetX, targetY)
-        local startedAtMs = getTimeInMillis()
+        local travelSeconds = BarteringTiming.travelSeconds(fromX, fromY, targetX, targetY, barterer.travelSecondsPerTile)
+        local startedAtMs = BarteringTiming.now()
         local arrivalAtMs = startedAtMs + travelSeconds * 1000
 
-        Bartering.setRegistryRecord(CALL_REGISTRY, bartererId,
-            buildCallRecord(player, barterer, startedAtMs, targetX, targetY, targetZ, arriveAtCallLocation, arrivalAtMs))
+        local callRecord = buildCallRecord(player, barterer, startedAtMs, targetX, targetY, targetZ, arriveAtCallLocation, arrivalAtMs)
+        callRecord.startX, callRecord.startY = fromX, fromY
+        Bartering.setRegistryRecord(CALL_REGISTRY, bartererId, callRecord)
         setPendingCall(bartererId, player, barterer, startedAtMs, targetX, targetY, targetZ, arriveAtCallLocation, arrivalAtMs)
-        setBartererETA(player, bartererId, arrivalAtMs, true, barterer.x, barterer.y, targetX, targetY, startedAtMs)
+        pendingCalls[bartererId].startX, pendingCalls[bartererId].startY = fromX, fromY
+        setBartererETA(player, bartererId, arrivalAtMs, true, fromX, fromY, targetX, targetY, startedAtMs)
+        local amendsPending = Bartering.Hostility.isAmendsPendingFor(bartererId, player)
         sendToClient(player, "callAccepted",
-            { bartererId = bartererId, message = "Yeah i can be there in about " .. BarteringTiming.formatArrivalEstimateHumanized(travelSeconds) })
+            { bartererId = bartererId, template = amendsPending and "amendsAccepted" or "accepted", live = "eta", message = string.format(BarteringDialogue.Call.accepted, BarteringTiming.formatArrivalEstimateHumanized(travelSeconds)) })
+        if amendsPending then
+            Bartering.Hostility.markAmendsCalled(bartererId)
+        end
     end
 
     local function updateBartererCallLocation(player, bartererId)
@@ -247,20 +460,21 @@ function BarteringCalls.new(config)
         end
 
         local targetX, targetY, targetZ = getCallTargetLocation(player)
-        local newTravelSeconds = getCallTravelSecondsToLocation(barterer, targetX, targetY)
-        local elapsedSeconds = math.max(0, (getTimeInMillis() - (call.startedAtMs or getTimeInMillis())) / 1000)
+        local newTravelSeconds = BarteringTiming.travelSecondsTo(barterer, targetX, targetY)
+        local elapsedSeconds = math.max(0, (BarteringTiming.now() - (call.startedAtMs or BarteringTiming.now())) / 1000)
         local adjustedRemainingSeconds = math.abs(newTravelSeconds - elapsedSeconds)
 
         call.player = player
         call.targetX = targetX
         call.targetY = targetY
         call.targetZ = targetZ
-        call.arrivalAtMs = getTimeInMillis() + adjustedRemainingSeconds * 1000
+        call.route = nil
+        call.arrivalAtMs = BarteringTiming.now() + adjustedRemainingSeconds * 1000
         Bartering.setRegistryRecord(CALL_REGISTRY, bartererId,
             buildCallRecord(player, barterer, call.startedAtMs, targetX, targetY, targetZ, true, call.arrivalAtMs))
         setBartererETA(player, bartererId, call.arrivalAtMs, true, barterer.x, barterer.y, targetX, targetY, call.startedAtMs)
         sendToClient(player, "callAccepted",
-            { bartererId = bartererId, message = "Yeah i can be there in about " .. BarteringTiming.formatArrivalEstimateHumanized(adjustedRemainingSeconds) })
+            { bartererId = bartererId, template = Bartering.Hostility.isAmendsPendingFor(bartererId, player) and "amendsAccepted" or "accepted", live = "eta", message = string.format(BarteringDialogue.Call.accepted, BarteringTiming.formatArrivalEstimateHumanized(adjustedRemainingSeconds)) })
     end
 
     local function debugCallBarterer(player, bartererId)
@@ -270,7 +484,6 @@ function BarteringCalls.new(config)
         end
 
         pendingCalls[bartererId] = nil
-        Bartering.setRegistryRecord(ACTIVE_CALLED_IN_REGISTRY, bartererId, nil)
         Bartering.setRegistryRecord(CALL_REGISTRY, bartererId, nil)
         Bartering.setRegistryRecord(RETURNING_HOME_REGISTRY, bartererId, nil)
         config.despawnBarterer(bartererId)
@@ -280,29 +493,11 @@ function BarteringCalls.new(config)
         if arriveAtCallLocation then
             targetX, targetY, targetZ = getCallTargetLocation(player)
         end
-        local now = getTimeInMillis()
+        local now = BarteringTiming.now()
         local arrivalAtMs = now + 2500
         setPendingCall(bartererId, player, barterer, now, targetX, targetY, targetZ, arriveAtCallLocation, arrivalAtMs)
         setBartererETA(player, bartererId, arrivalAtMs, true, barterer.x, barterer.y, targetX, targetY, now)
-        player:Say("Debug call sent for " .. Bartering.getBartererDisplayName(barterer.id))
-    end
-
-    local function startReturnHome(entry, barterer)
-        local zombie = entry.zombie
-        entry.hasArrived = true
-        entry.returningToPost = true
-        entry.returningAfterMeeting = true
-        entry.lostSightAt = nil
-        entry.postX, entry.postY = config.findSpawnLocation(barterer.x, barterer.y, barterer.z)
-        entry.postZ = barterer.z
-        entry.approachTargetX = nil
-        entry.approachTargetY = nil
-        entry.approachTargetZ = nil
-        entry.arrivalTime = nil
-        entry.departureAtMs = nil
-        BarteringAIUtils.clearPathing(zombie)
-        zombie:setVariable("BartererDepartureAtMs", "0")
-        zombie:setVariable("BartererState", "Return")
+        sendToClient(player, "playerSay", { text = "Debug call sent for " .. Bartering.getBartererDisplayName(barterer.id) })
     end
 
     local function cancelBartererMeeting(player, bartererId)
@@ -311,16 +506,12 @@ function BarteringCalls.new(config)
             return
         end
 
-        local now = getTimeInMillis()
+        local now = BarteringTiming.now()
         local elapsedSeconds = math.max(0, (now - call.startedAtMs) / 1000)
         local isGrace = (now - call.startedAtMs) <= GRACE_PERIOD_MS
+        local amendsCancel = Bartering.Hostility.isAmendsPendingFor(bartererId, player)
 
-        local lifeState = Bartering.getBartererLifeState(bartererId)
-        local worldAgeHours = getGameTime():getWorldAgeHours()
-        local cooldownGameHours = elapsedSeconds / BarteringTiming.realSecondsPerGameHour()
-        lifeState.calledInCooldownAt = worldAgeHours + cooldownGameHours
-        lifeState.returningHomeAt = worldAgeHours + cooldownGameHours
-        Bartering.markBartererDataDirty(bartererId)
+        returnLogic.beginReturnHome(bartererId, { player, call.player }, state.serverZombies[bartererId], elapsedSeconds, amendsCancel)
 
         local targetPlayer = call.player or player
         local relationsEnabled = Bartering.getSandboxBoolean("EnableRelationships", true)
@@ -328,7 +519,9 @@ function BarteringCalls.new(config)
         local mainMessage
         local relationsDelta = 0
 
-        if isGrace then
+        if amendsCancel then
+            mainMessage = "Whatever man.."
+        elseif isGrace then
             mainMessage = "Oh I hadn't actually left yet, glad you called before I did"
         else
             mainMessage = "Next time figure out what your doing before you waste my time"
@@ -337,10 +530,32 @@ function BarteringCalls.new(config)
             end
         end
 
+        local returnTrip
+        if not isGrace then
+            local barterer = call.barterer
+            local currentX, currentY = pendingCallPosition(call)
+            currentX = currentX or call.startX or barterer.x
+            currentY = currentY or call.startY or barterer.y
+            local travelSeconds = BarteringTiming.travelSeconds(
+                currentX, currentY, barterer.x, barterer.y, barterer.travelSecondsPerTile)
+            returnTrip = {
+                bartererId = bartererId,
+                startX = currentX,
+                startY = currentY,
+                targetX = barterer.x,
+                targetY = barterer.y,
+                elapsedMs = 0,
+                remainingMs = math.floor(travelSeconds * 1000),
+            }
+        end
+
         pendingCalls[bartererId] = nil
         Bartering.setRegistryRecord(CALL_REGISTRY, bartererId, nil)
         setBartererETA(targetPlayer, bartererId, 0, false)
         setBartererAvailability(targetPlayer, bartererId, true)
+        if returnTrip then
+            sendToClient(targetPlayer, "returnTrip", returnTrip)
+        end
 
         if relationsDelta ~= 0 then
             Bartering.Relations.add(targetPlayer, bartererId, relationsDelta)
@@ -350,50 +565,14 @@ function BarteringCalls.new(config)
             bartererId = bartererId,
             message = mainMessage,
             relationsDelta = relationsDelta,
+            hostile = amendsCancel == true or nil,
         })
-    end
-
-    local function sendBartererHome(player, bartererId)
-        local barterer = Bartering.Barterers[bartererId]
-        if not barterer then
-            return
-        end
-
-        if pendingCalls[bartererId] then
-            cancelBartererMeeting(player, bartererId)
-            return
-        end
-
-        for i = #state.barterers, 1, -1 do
-            local entry = state.barterers[i]
-            if entry.bartererId == bartererId and not entry.homeResident then
-                local owner = entry.master or player
-                startReturnHome(entry, barterer)
-                owner:Say(Bartering.getBartererDisplayName(barterer.id) .. " is returning home")
-                return
-            end
-        end
-    end
-
-    local function debugSpawnBarterer(player, bartererId)
-        local barterer = Bartering.Barterers[bartererId]
-        Bartering.ensureBartererIdentity(bartererId, true)
-        pendingCalls[bartererId] = nil
-        config.despawnBarterer(bartererId)
-
-        local targetX, targetY, targetZ
-        if Bartering.getSandboxNumber("ArriveAtCallLocation", 1) == 1 then
-            targetX, targetY, targetZ = getCallTargetLocation(player)
-        end
-        config.spawnBarterer(player, barterer, math.floor(player:getX()), math.floor(player:getY()), player:getZ(), false, nil,
-            targetX, targetY, targetZ)
-        setBartererETA(player, bartererId, 0, true)
     end
 
     local function debugSpawnBartererAt(player, bartererId, x, y, z)
         local barterer = Bartering.Barterers[bartererId]
-        Bartering.ensureBartererIdentity(bartererId, true)
-        pendingCalls[bartererId] = nil
+        Bartering.ensureBartererIdentity(bartererId)
+        consumePendingCall(bartererId)
         config.despawnBarterer(bartererId)
 
         local targetX, targetY, targetZ
@@ -404,177 +583,217 @@ function BarteringCalls.new(config)
         setBartererETA(player, bartererId, 0, true)
     end
 
+    local function debugSpawnBarterer(player, bartererId)
+        debugSpawnBartererAt(player, bartererId, math.floor(player:getX()), math.floor(player:getY()), 0)
+    end
+
+    local function arrive(bartererId, call, spawnX, spawnY)
+        local routeTrip = call.route and call.route.status == "ready" and call or nil
+        local record
+        if call.arrivalModeLocation then
+            record = config.spawnBarterer(call.player, call.barterer, spawnX, spawnY, nil, false, nil,
+                call.targetX, call.targetY, call.targetZ, routeTrip)
+        else
+            record = config.spawnBarterer(call.player, call.barterer, spawnX, spawnY, nil, false, nil,
+                nil, nil, nil, routeTrip)
+        end
+        if record and call.waitingAtMeetup then
+            record.meetupDeadlineHours = getGameTime():getWorldAgeHours()
+                + math.max(0, call.arrivalAtMs - BarteringTiming.now()) / 1000 / BarteringTiming.realSecondsPerGameHour()
+            record.departureAtHours = record.meetupDeadlineHours
+            Bartering.bumpLiveRev(record)
+        end
+        consumePendingCall(bartererId)
+        setBartererETA(call.player, bartererId, 0, true)
+        sendToClient(call.player, "playerSay", { text = Bartering.getBartererDisplayName(call.barterer.id) .. " is approaching" })
+    end
+
+    local function holdBartererAtMeetup(bartererId, call, now)
+        call.waitingAtMeetup = true
+        call.intercepted = false
+        call.route = nil
+        call.startX = call.targetX
+        call.startY = call.targetY
+        call.startedAtMs = now
+        call.arrivalAtMs = now + MEETUP_WAIT_HOLD_MS
+
+        local record = Bartering.getRegistryRecord(CALL_REGISTRY, bartererId)
+        if record then
+            record.waitingAtMeetup = true
+            record.startX = call.startX
+            record.startY = call.startY
+            record.remainingMs = MEETUP_WAIT_HOLD_MS
+        end
+
+        setBartererETA(call.player, bartererId, call.arrivalAtMs, true,
+            call.startX, call.startY, call.targetX, call.targetY, now, true)
+        print(string.format(
+            "[Bartering][Call] %s reached the meetup %d,%d with no player in range; holding there",
+            tostring(bartererId), call.targetX, call.targetY))
+    end
+
+    local function giveUpAtMeetup(bartererId, call)
+        local barterer = call.barterer
+        local travelSeconds = BarteringTiming.travelSeconds(
+            call.targetX, call.targetY, barterer.x, barterer.y, barterer.travelSecondsPerTile)
+        local arriveHomeAtMs = BarteringTiming.msFromSeconds(travelSeconds)
+
+        returnLogic.beginReturnHome(bartererId, { call.player }, nil, travelSeconds)
+        Bartering.setRegistryRecord(RETURNING_HOME_REGISTRY, bartererId, {
+            arriveHomeAtMs = arriveHomeAtMs,
+            remainingMs = math.max(0, arriveHomeAtMs - BarteringTiming.now()),
+            fromX = call.targetX,
+            fromY = call.targetY,
+            homeX = barterer.x,
+            homeY = barterer.y,
+            totalMs = math.max(1, math.floor(travelSeconds * 1000)),
+        })
+        consumePendingCall(bartererId)
+        setBartererAvailability(call.player, bartererId, true)
+        setBartererETA(call.player, bartererId, 0, false)
+        sendToClient(call.player, "returnTrip", {
+            bartererId = bartererId,
+            startX = call.targetX,
+            startY = call.targetY,
+            targetX = barterer.x,
+            targetY = barterer.y,
+            elapsedMs = 0,
+            remainingMs = math.floor(travelSeconds * 1000),
+        })
+        print(string.format(
+            "[Bartering][Call] %s gave up waiting at the meetup %d,%d; heading home in %.0fs",
+            tostring(bartererId), call.targetX, call.targetY, travelSeconds))
+    end
+
     local function updatePendingCalls()
-        local now = getTimeInMillis()
+        local now = BarteringTiming.now()
         for bartererId, call in pairs(pendingCalls) do
-            if config.hasTrackedBarterer(bartererId) then
-                pendingCalls[bartererId] = nil
+            if call.intercepted then
+                if intercept.update(bartererId, call, now) == "consumed" then
+                    consumePendingCall(bartererId)
+                end
+
+            elseif config.hasTrackedBarterer(bartererId) then
+                consumePendingCall(bartererId)
 
             elseif call.player:isDead() then
-                pendingCalls[bartererId] = nil
+                consumePendingCall(bartererId)
                 setBartererAvailability(call.player, bartererId, true)
                 setBartererETA(call.player, bartererId, 0, false)
 
             elseif now >= call.arrivalAtMs then
-                if call.arrivalModeLocation then
-                    config.spawnBarterer(call.player, call.barterer, nil, nil, nil, false, nil, call.targetX, call.targetY, call.targetZ)
+                if call.waitingAtMeetup then
+                    giveUpAtMeetup(bartererId, call)
+                elseif call.arrivalModeLocation
+                    and not BarteringIntercept.findPlayerNear(call.targetX, call.targetY) then
+                    holdBartererAtMeetup(bartererId, call, now)
                 else
-                    config.spawnBarterer(call.player, call.barterer)
+                    local fromX, fromY = pendingCallPosition(call)
+                    arrive(bartererId, call, math.floor(fromX), math.floor(fromY))
                 end
-                pendingCalls[bartererId] = nil
-                setBartererETA(call.player, bartererId, 0, true)
+
+            else
+                local x, y
+                if call.waitingAtMeetup then
+                    x, y = call.targetX, call.targetY
+                else
+                    x, y = pendingCallPosition(call)
+                end
+                persistCallProgress(bartererId, call, now, x, y)
+
+                local nearby = x and BarteringIntercept.findPlayerNear(x, y)
+                if nearby then
+                    local markerNearMeetup =
+                        BarteringAIUtils.distanceSq(x, y, call.targetX, call.targetY) <= BarteringIntercept.RADIUS_SQ
+                    local playerNearMeetup =
+                        BarteringAIUtils.distanceSq(nearby:getX(), nearby:getY(), call.targetX, call.targetY) <= BarteringIntercept.RADIUS_SQ
+                    if markerNearMeetup or playerNearMeetup then
+                        print(string.format(
+                            "[Bartering][Call] %s arriving early at %.0f,%.0f; %s reached the path with %.0fs left",
+                            tostring(bartererId), x, y, tostring(nearby:getUsername()), (call.arrivalAtMs - now) / 1000))
+                        arrive(bartererId, call, math.floor(x), math.floor(y))
+                    else
+                        intercept.begin(bartererId, call, x, y)
+                    end
+                end
             end
         end
     end
 
-    local function isVisibleToAnyPlayer(zombie)
-        return BarteringAIUtils.forEachPlayer(function(player)
-            if player:CanSee(zombie) then
-                return true
-            end
-        end)
-    end
+    local function holdDepartureWhileBusy(bartererId, record)
+        local st = config.serverStateFor(bartererId)
+        local now = getGameTime():getWorldAgeHours()
+        local previous = st.departureHeldAtHours
+        st.departureHeldAtHours = now
 
-    local function shouldExpire(entry)
-        if entry.returningAfterMeeting then
-            if entry.zombie and isVisibleToAnyPlayer(entry.zombie) then
-                entry.lostSightAt = nil
-                return false
-            end
-            local now = getTimeInMillis()
-            if not entry.lostSightAt then
-                entry.lostSightAt = now
-                return false
-            end
-            if now - entry.lostSightAt < RETURN_OUT_OF_SIGHT_GRACE_MS then
-                return false
-            end
-            print("[Bartering][ServerDebug] barterer " .. tostring(entry.bartererId)
-                .. " out of sight " .. tostring(now - entry.lostSightAt) .. "ms while returning; expiring")
-            return true
+        if not previous or not record.departureAtHours then
+            return
         end
 
-        if entry.homeResident or not entry.arrivalTime then
+        local barterState = record.state or ""
+        if barterState == "Waiting" or barterState == "BlockedByDoor" or barterState == "BlockedRoute" then
+            return
+        end
+
+        record.departureAtHours = record.departureAtHours + (now - previous)
+    end
+
+    local function shouldExpire(bartererId, record)
+        holdDepartureWhileBusy(bartererId, record)
+
+        if record.intercepted then
+            return intercept.shouldExpire(bartererId, record)
+        end
+
+        if record.returningAfterMeeting then
+            return returnLogic.shouldExpireReturningHome(bartererId, record)
+        end
+
+        if record.homeResident then
             return false
         end
 
-        local departureAtMs = entry.departureAtMs
-        if (not departureAtMs or departureAtMs <= 0) and entry.zombie then
-            departureAtMs = tonumber(entry.zombie:getVariableString("BartererDepartureAtMs")) or 0
-            if departureAtMs > 0 then
-                entry.departureAtMs = departureAtMs
-            end
-        end
-
-        if departureAtMs and departureAtMs > 0 then
-            return getTimeInMillis() >= departureAtMs
-        end
-
-        return BarteringTiming.minutesSince(entry.arrivalTime) >= math.floor(CALLED_IN_LIFETIME_HOURS * 60)
+        return record.departureAtHours ~= nil and getGameTime():getWorldAgeHours() >= record.departureAtHours
     end
 
-    local function clearActiveCalledInEntry(entry)
-        if not entry.homeResident then
-            Bartering.setRegistryRecord(ACTIVE_CALLED_IN_REGISTRY, entry.bartererId, nil)
-        end
-    end
+    intercept = BarteringIntercept.new({
+        state = state,
+        spawnBarterer = config.spawnBarterer,
+        despawnBarterer = config.despawnBarterer,
+        setBartererETA = setBartererETA,
+        consumePendingCall = consumePendingCall,
+        pendingCalls = pendingCalls,
+        buildCallRecord = buildCallRecord,
+        callRegistry = CALL_REGISTRY,
+        serverStateFor = config.serverStateFor,
+    })
 
-    local function handleExpiry(entry, zombie)
-        if entry.returningAfterMeeting then
-            local barterer = Bartering.Barterers[entry.bartererId]
-            local homeX = entry.postX
-            local homeY = entry.postY
-            if not homeX then
-                homeX = barterer and barterer.x
-                homeY = barterer and barterer.y
-            end
-            local travelSeconds = 0
-            local returnTrip
-            if barterer and homeX and homeY then
-                travelSeconds = BarteringTiming.calculateTravelSeconds(
-                    zombie:getX(), zombie:getY(),
-                    homeX + 0.5, homeY + 0.5,
-                    barterer.travelSecondsPerTile,
-                    Bartering.getSandboxNumber("TravelTimeMultiplier", 1))
-                returnTrip = {
-                    bartererId = entry.bartererId,
-                    startX = zombie:getX(),
-                    startY = zombie:getY(),
-                    targetX = homeX + 0.5,
-                    targetY = homeY + 0.5,
-                    startedAtMs = getTimeInMillis(),
-                    arrivalAtMs = getTimeInMillis() + math.floor(travelSeconds * 1000),
-                }
-            end
-            local arriveHomeAtMs = getTimeInMillis() + math.floor(travelSeconds * 1000)
+    returnLogic = BarteringReturn.newSentHome({
+        state = state,
+        pendingCalls = pendingCalls,
+        intercept = intercept,
+        consumePendingCall = consumePendingCall,
+        sendToClient = sendToClient,
+        setBartererETA = setBartererETA,
+        setBartererAvailability = setBartererAvailability,
+        cancelBartererMeeting = cancelBartererMeeting,
+        despawnBarterer = config.despawnBarterer,
+        serverStateFor = config.serverStateFor,
+        config = config,
+    })
 
-            Bartering.setRegistryRecord(RETURNING_HOME_REGISTRY, entry.bartererId, {
-                arriveHomeAtMs = arriveHomeAtMs,
-            })
-            clearActiveCalledInEntry(entry)
-            config.clearCombatTask(entry)
-            setBartererAvailability(entry.master, entry.bartererId, true)
-            setBartererETA(entry.master, entry.bartererId, 0, false)
-            if returnTrip then
-                sendToClient(entry.master, "returnTrip", returnTrip)
-            end
-            if zombie:getSquare() then
-                config.despawnZombie(zombie)
-            end
-
-            print(string.format(
-                "[Bartering][ServerDebug] barterer %s despawned returning home; finishes trip in %.0fs arriveHomeAtMs=%d",
-                tostring(entry.bartererId), travelSeconds, arriveHomeAtMs))
-            return false
-        end
-
-        local barterer = Bartering.Barterers[entry.bartererId]
-        if barterer then
-            startReturnHome(entry, barterer)
-            config.clearCombatTask(entry)
-        end
-        return true
-    end
-
-    local function persistActiveCalledInEntry(entry, zombie, force)
-        if entry.homeResident then
+    local function handleExpiry(bartererId, record, zombie)
+        if record.intercepted then
+            intercept.resumeTrip(bartererId, record, zombie)
             return
         end
 
-        if zombie:isDead() or zombie:getHealth() <= 0 then
-            Bartering.setRegistryRecord(ACTIVE_CALLED_IN_REGISTRY, entry.bartererId, nil)
-            print("[Bartering][ServerDebug] called-in barterer " .. tostring(entry.bartererId)
-                .. " is dead; cleared active called-in record instead of persisting")
+        if record.returningAfterMeeting then
+            returnLogic.handleExpiryReturningHome(bartererId, record, zombie)
             return
         end
 
-        entry.activeRecordCooldown = (entry.activeRecordCooldown or 0) - 1
-        if entry.activeRecordCooldown > 0 and not force then
-            return
-        end
-        entry.activeRecordCooldown = ACTIVE_CALLED_IN_PERSIST_TICKS
-
-        local master = entry.master
-        Bartering.setRegistryRecord(ACTIVE_CALLED_IN_REGISTRY, entry.bartererId, {
-            bartererId = entry.bartererId,
-            x = math.floor(zombie:getX()),
-            y = math.floor(zombie:getY()),
-            z = zombie:getZ(),
-            state = zombie:getVariableString("BartererState") or "",
-            hasArrived = entry.hasArrived == true,
-            arrivalTime = entry.arrivalTime,
-            returningToPost = entry.returningToPost == true,
-            returningAfterMeeting = entry.returningAfterMeeting == true,
-            postX = entry.postX,
-            postY = entry.postY,
-            postZ = entry.postZ,
-            approachTargetX = entry.approachTargetX,
-            approachTargetY = entry.approachTargetY,
-            approachTargetZ = entry.approachTargetZ,
-            departureAtMs = entry.departureAtMs,
-            masterOnlineId = master and tostring(master:getOnlineID()) or nil,
-            masterName = master and tostring(master:getUsername()) or nil,
-        })
+        returnLogic.startReturnHome(bartererId, record, Bartering.Barterers[bartererId])
     end
 
     local function registerCalledInCleanup(x, y, z)
@@ -582,7 +801,7 @@ function BarteringCalls.new(config)
             x = x,
             y = y,
             z = z,
-            expiresAt = getTimeInMillis() + CALLED_IN_CLEANUP_WINDOW_MS,
+            expiresAt = BarteringTiming.now() + CALLED_IN_CLEANUP_WINDOW_MS,
         })
     end
 
@@ -591,7 +810,7 @@ function BarteringCalls.new(config)
             return
         end
 
-        local now = getTimeInMillis()
+        local now = BarteringTiming.now()
         local zombies = getCell():getZombieList()
         for i = #calledInCleanups, 1, -1 do
             local cleanup = calledInCleanups[i]
@@ -604,7 +823,7 @@ function BarteringCalls.new(config)
                 for j = 0, zombies:size() - 1 do
                     local zombie = zombies:get(j)
                     if not zombie:isDead()
-                        and not zombie:getVariableBoolean("Barterer")
+                        and not state.serverZombieIds[zombie]
                         and zombie:getZ() == cleanup.z then
                         local distSq = BarteringAIUtils.distanceSqToTile(zombie:getX(), zombie:getY(), cleanup.x, cleanup.y)
                         if distSq <= CALLED_IN_CLEANUP_RADIUS_SQ and (not closestDistSq or distSq < closestDistSq) then
@@ -615,7 +834,7 @@ function BarteringCalls.new(config)
                 end
 
                 if closest then
-                    config.despawnZombie(closest)
+                    Bartering.removeZombieEverywhere(closest)
                     resolved = true
                 end
             end
@@ -628,28 +847,18 @@ function BarteringCalls.new(config)
 
     local function spawnRestoredCalledInBarterer(barterer, record, removeLeftover)
         config.clearBartererDeath(barterer.id)
-        config.despawnBarterer(barterer.id)
 
-        local master = config.resolvePlayerFromRecord({
-            BartererMaster = record.masterOnlineId,
-            BartererMasterName = record.masterName,
-        })
-
-        local z = record.z or (master and master:getZ()) or 0
-        local departureAtMs = tonumber(record.departureAtMs) or 0
         local restoredState = record.state
         if restoredState == nil or restoredState == "" then
             restoredState = record.hasArrived and "Waiting" or "Approach"
         end
 
-        local zombie, gun, knife = config.createBartererZombie({
+        local z = record.z or 0
+        local zombie, gun, knife, x, y = config.createBartererZombie({
             barterer = barterer,
-            master = master,
             spawnX = record.x,
             spawnY = record.y,
             spawnZ = z,
-            calledIn = true,
-            departureAtMs = departureAtMs,
             bartererState = restoredState,
             useless = record.hasArrived == true and not record.returningAfterMeeting,
         })
@@ -657,51 +866,46 @@ function BarteringCalls.new(config)
             return false
         end
 
-        config.trackBarterer({
-            zombie = zombie,
-            bartererId = barterer.id,
-            master = master,
-            gun = gun,
-            knife = knife,
-            projectileCount = Bartering.getBartererWeapon(barterer.id).projectileCount or 1,
-            homeResident = false,
-            hasArrived = record.hasArrived == true,
-            returningToPost = record.returningToPost == true,
-            returningAfterMeeting = record.returningAfterMeeting == true,
-            postX = record.postX or record.x,
-            postY = record.postY or record.y,
-            postZ = record.postZ or z,
-            approachTargetX = record.approachTargetX,
-            approachTargetY = record.approachTargetY,
-            approachTargetZ = record.approachTargetZ,
-            arrivalTime = record.arrivalTime
-                or (record.hasArrived and getGameTime():getMinutesStamp() or nil),
-            departureAtMs = departureAtMs > 0 and departureAtMs or nil,
-        })
+        config.registerLive(barterer, zombie, gun, knife, record)
 
         if removeLeftover then
-            registerCalledInCleanup(record.x, record.y, z)
+            registerCalledInCleanup(x, y, z)
         end
 
         print(string.format(
-            "[Bartering][ServerDebug] restored called-in %s state=%s arrived=%s returning=%s arrivalTime=%s departAtMs=%s",
+            "[Bartering][ServerDebug] restored called-in %s state=%s arrived=%s returning=%s departAtHours=%s",
             tostring(barterer.id), tostring(restoredState), tostring(record.hasArrived),
-            tostring(record.returningAfterMeeting), tostring(record.arrivalTime),
-            tostring(record.departureAtMs)))
+            tostring(record.returningAfterMeeting), tostring(record.departureAtHours)))
 
         return true
     end
 
-    local function pruneActiveCalledInRecords()
-        for bartererId, record in pairs(ModData.getOrCreate(ACTIVE_CALLED_IN_REGISTRY)) do
+    local function updateUnloaded(bartererId, record)
+        if BarteringHire.isHired(bartererId) then
+            return
+        end
+        local masterGone = record.master ~= nil and not Bartering.findOnlinePlayer(record.master)
+        local departed = record.departureAtHours ~= nil and getGameTime():getWorldAgeHours() >= record.departureAtHours
+        if not masterGone and not departed and not record.returningAfterMeeting then
+            return
+        end
+        print(string.format("[Bartering][MP] unloaded %s heading home | masterGone=%s departed=%s returning=%s",
+            tostring(bartererId), tostring(masterGone), tostring(departed), tostring(record.returningAfterMeeting)))
+        consumePendingCall(bartererId)
+        returnLogic.sendUnloadedHome(bartererId, record)
+    end
+
+    local function pruneLiveRecords()
+        local records = Bartering.getLiveRecords()
+        for bartererId, record in pairs(records) do
             local barterer = Bartering.Barterers[bartererId]
             local lifeState = Bartering.getBartererLifeState(bartererId)
             local awaitingRespawn = BarteringTiming.remainingHours(lifeState.respawnAt) > 0
-            local master = config.resolvePlayerFromRecord(record)
-            if not barterer or Bartering.isBartererPermanentlyDead(bartererId) or awaitingRespawn
-                or (master and master:isDead()) then
-                Bartering.setRegistryRecord(ACTIVE_CALLED_IN_REGISTRY, bartererId, nil)
+            if not barterer or record.homeResident or Bartering.isBartererPermanentlyDead(bartererId) or awaitingRespawn then
+                records[bartererId] = nil
             else
+                record.unloaded = true
+                record.zid = nil
                 print("[Bartering] Called-in barterer " .. tostring(bartererId)
                     .. " will reload at " .. tostring(record.x) .. "," .. tostring(record.y) .. "," .. tostring(record.z)
                     .. " state=" .. tostring(record.state) .. " arrived=" .. tostring(record.hasArrived))
@@ -710,10 +914,11 @@ function BarteringCalls.new(config)
             pendingCalls[bartererId] = nil
             Bartering.setRegistryRecord(CALL_REGISTRY, bartererId, nil)
         end
+        Bartering.markLiveDirty()
     end
 
     local function clearPendingCall(bartererId)
-        pendingCalls[bartererId] = nil
+        consumePendingCall(bartererId)
     end
 
     local function hasPendingCall(bartererId)
@@ -721,7 +926,9 @@ function BarteringCalls.new(config)
     end
 
     local function resetState()
-        pendingCalls = {}
+        for bartererId in pairs(pendingCalls) do
+            pendingCalls[bartererId] = nil
+        end
         calledInCleanups = {}
         callRegistryInitialized = false
     end
@@ -729,26 +936,33 @@ function BarteringCalls.new(config)
     return {
         shouldExpire = shouldExpire,
         handleExpiry = handleExpiry,
-        persistActiveCalledInEntry = persistActiveCalledInEntry,
-        clearActiveCalledInEntry = clearActiveCalledInEntry,
+        clearIntercept = intercept.clear,
         processCalledInCleanups = processCalledInCleanups,
-        pruneActiveCalledInRecords = pruneActiveCalledInRecords,
+        pruneLiveRecords = pruneLiveRecords,
+        updateUnloaded = updateUnloaded,
         spawnRestoredCalledInBarterer = spawnRestoredCalledInBarterer,
         clearPendingCall = clearPendingCall,
         hasPendingCall = hasPendingCall,
         registerCalledInCleanup = registerCalledInCleanup,
         resetState = resetState,
+        sendToClient = sendToClient,
         setBartererAvailability = setBartererAvailability,
         setBartererETA = setBartererETA,
         bootstrapPersistedCalls = bootstrapPersistedCalls,
         callBarterer = callBarterer,
+        radioStatus = radioStatus,
         updateBartererCallLocation = updateBartererCallLocation,
         debugCallBarterer = debugCallBarterer,
         cancelBartererMeeting = cancelBartererMeeting,
-        sendBartererHome = sendBartererHome,
+        sendBartererHome = returnLogic.sendBartererHome,
+        sendPlayerBarterersHome = returnLogic.sendPlayerBarterersHome,
         debugSpawnBarterer = debugSpawnBarterer,
         debugSpawnBartererAt = debugSpawnBartererAt,
+        debugSendAllHomeNow = returnLogic.debugSendAllHomeNow,
         updatePendingCalls = updatePendingCalls,
+        acceptStayHere = intercept.stayHere,
+        declineTradeHere = intercept.decline,
+        noteInterceptDialog = intercept.noteDialog,
     }
 end
 

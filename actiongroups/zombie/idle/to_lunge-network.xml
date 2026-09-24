@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transition>
+	<transitionTo>lunge-network</transitionTo>
+	<conditions>
+		<isTrue>bLunge</isTrue>
+		<isTrue>bClient</isTrue>
+		<isFalse>Barterer</isFalse>
+	</conditions>
+</transition>

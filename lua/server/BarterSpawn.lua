@@ -1,8 +1,11 @@
-local addZombiesInOutfit = _G["addZombiesInOutfit"]
+local createZombie = _G["createZombie"]
 local IsoDirections = _G["IsoDirections"]
-local ModData = _G["ModData"]
+local getCell = _G["getCell"]
 local BarteringAIUtils = require "BarteringAIUtils"
 local BarteringTiming = require "BarteringTiming"
+local BarteringIntercept = require "Movement/BarteringIntercept"
+local BarteringReturn = require "Movement/BarteringReturn"
+local print = require("BarteringPathTrace").log
 
 local BarterSpawn = {}
 
@@ -10,33 +13,29 @@ BarterSpawn.DORMANT_DISTANCE = 40
 BarterSpawn.DORMANT_DISTANCE_SQ = BarterSpawn.DORMANT_DISTANCE * BarterSpawn.DORMANT_DISTANCE
 BarterSpawn.LOAD_DISTANCE = 30
 BarterSpawn.LOAD_DISTANCE_SQ = BarterSpawn.LOAD_DISTANCE * BarterSpawn.LOAD_DISTANCE
+BarterSpawn.STARTING_AMMO = 90
+BarterSpawn.STARTING_MAGAZINES = 5
 
 local MAX_TILES_PER_TICK_SQ = 16
-local STARTING_AMMO = 90
 local SPAWN_SCAN_INTERVAL_TICKS = 60
+local PROBE_HOME_RADIUS_SQ = 6 * 6
+local PROBE_HOME_TICKS = 60 * 90
 
 function BarterSpawn.new(config)
     local state = config.state
-    local log = config.logBartererServerDebug
     local scanTicks = 0
     local leftoverCleanupPending = {}
+    local spawnCounter = 0
 
     local function despawnZombie(zombie)
-        zombie:removeFromWorld()
-        zombie:removeFromSquare()
+        Bartering.removeZombieEverywhere(zombie)
     end
-
-    local function hasTrackedBarterer(bartererId)
-        return BarteringAIUtils.findBartererEntry(state.barterers, bartererId) ~= nil
-    end
-
 
     local function trackBarterer(entry)
-        local zombie = entry.zombie
         entry.attackCooldown = 0
         entry.returnFarTicks = 0
+        entry.blockedOpenables = {}
         entry.idleTurnTicks = config.idleTurnIntervalTicks
-        entry.lastX, entry.lastY, entry.lastZ = zombie:getX(), zombie:getY(), zombie:getZ()
         table.insert(state.barterers, entry)
         return entry
     end
@@ -48,63 +47,117 @@ function BarterSpawn.new(config)
         return entry
     end
 
+    local function localItem(zombie, itemType)
+        local inventory = zombie:getInventory()
+        return inventory:getFirstTypeRecurse(itemType) or inventory:AddItem(itemType)
+    end
+
+    local function attachController(zombie, bartererId, record)
+        local weapon = Bartering.getBartererWeapon(bartererId)
+        local entry = trackBarterer({
+            zombie = zombie,
+            bartererId = bartererId,
+            seq = record.seq,
+            zid = zombie:getOnlineID(),
+            gun = localItem(zombie, weapon.item),
+            knife = localItem(zombie, Bartering.Barterers[bartererId].equipment.knife),
+            projectileCount = weapon.projectileCount or 1,
+            lastX = zombie:getX(),
+            lastY = zombie:getY(),
+            lastZ = zombie:getZ(),
+        })
+        if entry.gun:getCurrentAmmoCount() == 0 then
+            local capacity = entry.gun:getMaxAmmo()
+            local loaded = math.min(capacity, record.ammo)
+            if entry.gun:getMagazineType() and record.ammo % capacity > 0 then
+                loaded = record.ammo % capacity
+            end
+            entry.gun:setCurrentAmmoCount(loaded)
+        end
+        entry.ammoReserve = record.ammo - entry.gun:getCurrentAmmoCount()
+        print(string.format("[Bartering][Ammo] attach %s gun=%s loaded=%d max=%d recordAmmo=%d reserve=%d",
+            bartererId, tostring(entry.gun), entry.gun:getCurrentAmmoCount(), entry.gun:getMaxAmmo(),
+            record.ammo, entry.ammoReserve))
+        config.applyRecord(entry, record)
+        config.combat.equipWeapon(zombie, entry.gun, weapon.weaponType)
+        return entry
+    end
+
+    local function hasTrackedBarterer(bartererId)
+        local record = Bartering.getLiveRecord(bartererId)
+        return record ~= nil and not record.unloaded
+    end
+
+    local function forgetServerZombie(bartererId)
+        local zombie = state.serverZombies[bartererId]
+        if zombie then
+            state.serverZombieIds[zombie] = nil
+        end
+        state.serverZombies[bartererId] = nil
+        state.serverItems[bartererId] = nil
+        state.serverState[bartererId] = nil
+    end
+
+    local function removeLive(bartererId)
+        forgetServerZombie(bartererId)
+        Bartering.getLiveRecords()[bartererId] = nil
+        Bartering.markLiveDirty()
+    end
+
+    local function despawnBarterer(bartererId)
+        local zombie = state.serverZombies[bartererId]
+        removeLive(bartererId)
+        leftoverCleanupPending[bartererId] = nil
+        if zombie then
+            despawnZombie(zombie)
+        end
+    end
+
+    local function markUnloaded(bartererId, record)
+        forgetServerZombie(bartererId)
+        if record.homeResident then
+            Bartering.getLiveRecords()[bartererId] = nil
+            Bartering.markLiveDirty()
+            return
+        end
+        record.unloaded = true
+        record.zid = nil
+        Bartering.bumpLiveRev(record)
+    end
+
+    local function unloadBarterer(bartererId, record, zombie)
+        print(string.format("[Bartering][MP] %s no player in range; unloading until a player returns", tostring(bartererId)))
+        leftoverCleanupPending[bartererId] = nil
+        markUnloaded(bartererId, record)
+        despawnZombie(zombie)
+    end
+
     local function noteLeftover(bartererId)
         leftoverCleanupPending[bartererId] = true
     end
 
-    local function despawnBartererEntry(index)
-        local entry = untrackEntry(index)
-        leftoverCleanupPending[entry.bartererId] = nil
-        despawnZombie(entry.zombie)
-    end
-
-    local function despawnBarterer(bartererId)
-        for i = #state.barterers, 1, -1 do
-            if state.barterers[i].bartererId == bartererId then
-                despawnBartererEntry(i)
-            end
+    local function ownsServerZombie(bartererId, record, zombie)
+        if isServer() then
+            return zombie:getOnlineID() == record.zid
         end
-    end
-
-
-    local function deprovisionBarterer(zombie)
-        zombie:setVariable("Barterer", false)
-        zombie:setVariable("BartererId", "")
-        zombie:setVariable("BartererState", "")
-        zombie:setPrimaryHandItem(nil)
-        zombie:setSecondaryHandItem(nil)
-        zombie:setUseless(false)
-        zombie:setNoTeeth(false)
-        zombie:setReanim(false)
-        zombie:resetEquippedHandsModels()
-        zombie:clearAttachedItems()
-    end
-
-    local function ownsZombie(entry)
-        local zombie = entry.zombie
-        if zombie:getVariableString("BartererId") ~= entry.bartererId then
+        if zombie:getVariableString("BartererId") ~= bartererId then
             return false
         end
-
+        local st = state.serverStateFor(bartererId)
         local x, y, z = zombie:getX(), zombie:getY(), zombie:getZ()
-        if BarteringAIUtils.distanceSq(x, y, entry.lastX, entry.lastY) > MAX_TILES_PER_TICK_SQ
-            or math.abs(z - entry.lastZ) > 1 then
+        if st.lastX and (BarteringAIUtils.distanceSq(x, y, st.lastX, st.lastY) > MAX_TILES_PER_TICK_SQ
+            or math.abs(z - st.lastZ) > 1) then
             return false
         end
-
-        entry.lastX, entry.lastY, entry.lastZ = x, y, z
+        st.lastX, st.lastY, st.lastZ = x, y, z
         return true
     end
 
-    local function releaseLostEntry(index)
-        local entry = state.barterers[index]
-        print(string.format(
-            "[Bartering][ServerDebug] barterer %s no longer owns its zombie (engine reused the instance); releasing entry at %.2f,%.2f,%.2f",
-            tostring(entry.bartererId), entry.zombie:getX(), entry.zombie:getY(), entry.zombie:getZ()))
-        noteLeftover(entry.bartererId)
-        untrackEntry(index)
-        deprovisionBarterer(entry.zombie)
-        entry.zombie:setZombiesDontAttack(false)
+    local function releaseLost(bartererId, record, zombie, reason)
+        print(string.format("[Bartering][MP] %s lost its zombie (%s); releasing at %.2f,%.2f,%.2f",
+            tostring(bartererId), tostring(reason), zombie:getX(), zombie:getY(), zombie:getZ()))
+        noteLeftover(bartererId)
+        markUnloaded(bartererId, record)
     end
 
     local function isPlayerNearTile(x, y, maxDistSq)
@@ -114,14 +167,53 @@ function BarterSpawn.new(config)
     end
 
     local function findPlayerNearHome(barterer)
-        local found = nil
-        BarteringAIUtils.forEachPlayer(function(player)
-            if Bartering.isNearAnySpawnLocation(barterer, player:getX(), player:getY(), BarterSpawn.LOAD_DISTANCE_SQ) then
-                found = player
-                return true
-            end
+        return BarteringAIUtils.findPlayer(function(player)
+            return Bartering.isNearBartererHome(barterer, player:getX(), player:getY(), BarterSpawn.LOAD_DISTANCE_SQ)
         end)
-        return found
+    end
+
+    local probeTicks = 0
+
+    local function probeZombie(zombie)
+        return string.format(
+            "zid=%s pos=%.2f,%.2f,%.2f square=%s outfit=%s barterer=%s id=[%s] state=[%s] action=%s useless=%s visuals=[%s]",
+            tostring(zombie:getOnlineID()), zombie:getX(), zombie:getY(), zombie:getZ(),
+            tostring(zombie:getSquare() ~= nil),
+            tostring(zombie:getPersistentOutfitID()),
+            tostring(zombie:getVariableBoolean("Barterer")),
+            tostring(zombie:getVariableString("BartererId")),
+            tostring(zombie:getVariableString("BartererState")),
+            tostring(zombie:getActionStateName()),
+            tostring(zombie:isUseless()),
+            Bartering.describeItemVisuals(zombie))
+    end
+
+    local function probeOnZombieCreate(zombie)
+        print(string.format("[Bartering][Probe][Create] %s", probeZombie(zombie)))
+    end
+
+    local function probeHomes()
+        probeTicks = probeTicks + 1
+        if not state.residentsInitialized or probeTicks > PROBE_HOME_TICKS or (probeTicks % 60) ~= 0 then
+            return
+        end
+        local zombies = getCell():getZombieList()
+        for _, barterer in pairs(Bartering.Barterers) do
+            local identity = Bartering.getBartererIdentityState(barterer.id)
+            for i = 0, zombies:size() - 1 do
+                local zombie = zombies:get(i)
+                if zombie:getZ() == barterer.z
+                    and BarteringAIUtils.distanceSqToTile(zombie:getX(), zombie:getY(), barterer.x, barterer.y) <= PROBE_HOME_RADIUS_SQ then
+                    print(string.format(
+                        "[Bartering][Probe][Home] t=%d %s home=%d,%d,%d wearsOutfit=%s expected=[%s] | %s",
+                        probeTicks, tostring(barterer.id), barterer.x, barterer.y, barterer.z,
+                        tostring(identity.clothing ~= nil
+                            and Bartering.bartererVisualsMatch(zombie, identity.clothing)),
+                        identity.clothing and table.concat(identity.clothing, ";") or "",
+                        probeZombie(zombie)))
+                end
+            end
+        end
     end
 
     local function requestLeftoverCleanup(bartererId, x, y, z)
@@ -142,13 +234,15 @@ function BarterSpawn.new(config)
         return true
     end
 
-    local function markBartererDeath(bartererId, cause)
+    local function markBartererDeath(bartererId, cause, witnessed)
         local lifeState = Bartering.getBartererLifeState(bartererId)
         Bartering.markBartererDataDirty(bartererId)
         lifeState.deathCause = cause
+        lifeState.deathWitnessed = witnessed == true
         if shouldRespawnForCause(cause) then
             lifeState.permanentlyDead = false
             lifeState.respawnAt = getGameTime():getWorldAgeHours() + Bartering.getSandboxNumber("RespawnHours", 6)
+            Bartering.clearBartererHome(bartererId)
             return false
         end
 
@@ -162,174 +256,143 @@ function BarterSpawn.new(config)
         lifeState.permanentlyDead = false
         lifeState.deathCause = nil
         lifeState.respawnAt = nil
+        lifeState.deathWitnessed = nil
+        lifeState.deathDiscovered = nil
         Bartering.markBartererDataDirty(bartererId)
+        Bartering.clearReturningHomeKnowledge(bartererId)
     end
 
-    local function setBartererMaster(zombie, master)
-        if not master then
-            return
-        end
-
-        zombie:setVariable("BartererMaster", tostring(master:getOnlineID()))
-        zombie:setVariable("BartererMasterName", tostring(master:getUsername()))
-    end
-
-    local function equipBartererZombie(zombie, barterer, master)
+    local function equipBartererZombie(zombie, barterer)
         local weapon = Bartering.getBartererWeapon(barterer.id)
         local inventory = zombie:getInventory()
         local gun = inventory:getFirstTypeRecurse(weapon.item) or inventory:AddItem(weapon.item)
         local knife = inventory:getFirstTypeRecurse(barterer.equipment.knife)
             or inventory:AddItem(barterer.equipment.knife)
-
-        if inventory:getCountTypeRecurse(weapon.ammoItem) == 0 then
-            for _ = 1, STARTING_AMMO do
-                inventory:AddItem(weapon.ammoItem)
-            end
-        end
-
-        Bartering.syncBartererStockToContainer(Bartering.getBartererBag(zombie), barterer.id, master)
-        config.combat.equipWeapon(zombie, gun, weapon.weaponType)
-
-        return gun, knife, weapon
+        Bartering.syncBartererStockToContainer(Bartering.getBartererBag(zombie), barterer.id)
+        return gun, knife
     end
 
     local function createBartererZombie(params)
         local barterer = params.barterer
         local identity = Bartering.ensureBartererIdentity(barterer.id, params.forceNewIdentity)
         local z = params.spawnZ
-        local x, y = config.findSpawnLocation(params.spawnX, params.spawnY, z)
+        local x, y = config.findSpawnLocation(math.floor(params.spawnX), math.floor(params.spawnY), z)
 
-        local femaleChance = barterer.gender == "female" and 100 or 0
-        local zombieList = addZombiesInOutfit(x, y, z, 1, "Naked1", femaleChance)
-        print("[Bartering] Spawning " .. Bartering.getBartererDisplayName(barterer.id) .. " at " .. tostring(x) .. ", " .. tostring(y) .. ", " .. tostring(z) .. "; result count " .. tostring(zombieList:size()))
-        if zombieList:size() == 0 then
+        print(string.format("[Bartering][Probe][SpawnPre] %s asking for %d,%d,%d", tostring(barterer.id), x, y, z))
+        local zombie = createZombie(x, y, z, nil, 0, IsoDirections.S)
+        print(string.format("[Bartering][Probe][SpawnPost] %s %s", tostring(barterer.id), probeZombie(zombie)))
+        local square = getCell():getGridSquare(x, y, z)
+        print(string.format(
+            "[Bartering] Spawning %s at %s, %s, %s; created=%s | asked=%s,%s square=%s free=%s standable=%s",
+            Bartering.getBartererDisplayName(barterer.id),
+            tostring(x), tostring(y), tostring(z), tostring(zombie ~= nil),
+            tostring(params.spawnX), tostring(params.spawnY),
+            tostring(square ~= nil),
+            tostring(square and square:isFree(false)),
+            tostring(BarteringAIUtils.isStandableSquare(square))))
+        if not zombie then
             return nil
         end
 
-        local zombie = zombieList:get(0)
         Bartering.applyBartererIdentityToZombie(zombie, barterer.id)
-
-        zombie:setNoTeeth(true)
+        Bartering.provisionBartererZombie(zombie, barterer.id)
         zombie:setUseless(params.useless == true)
-        zombie:setReanim(false)
-        zombie:clearAggroList()
-        zombie:setVariable("Barterer", true)
-        zombie:setVariable("BartererId", barterer.id)
-        zombie:setVariable("BartererCalledIn", params.calledIn)
-        zombie:setVariable("BartererDepartureAtMs", tostring(params.departureAtMs))
-        zombie:setVariable("BartererMuzzleFlashAt", "0")
-
-        setBartererMaster(zombie, params.master)
-
-        zombie:setWalkType("BartererWalk")
-        zombie:setVariable("BartererWalkType", "BartererWalk")
-        zombie:setVariable("ZombieHitReaction", "Chainsaw")
-        zombie:resetEquippedHandsModels()
-        zombie:clearAttachedItems()
-        zombie:setTurnAlertedValues(-5, 5)
+        zombie:setVariable("BartererState", params.bartererState)
         BarteringAIUtils.resetPassiveState(zombie)
         zombie:setDir(IsoDirections.S)
-        zombie:setVariable("MovementSpeed", "1.00")
-        zombie:setVariable("BartererState", params.bartererState)
-        zombie:setVariable("BartererVisualsApplied", false)
 
         Bartering.dressBartererZombie(zombie, identity)
-        Bartering.storeBartererIdentityOnZombie(zombie, barterer.id)
+        Bartering.captureBartererIdentity(zombie, barterer.id)
 
-        local gun, knife = equipBartererZombie(zombie, barterer, params.master)
-
+        local gun, knife = equipBartererZombie(zombie, barterer)
+        print(string.format("[Bartering][Probe][SpawnDone] %s %s", tostring(barterer.id), probeZombie(zombie)))
         return zombie, gun, knife, x, y
     end
 
-    local function spawnBarterer(player, barterer, spawnX, spawnY, spawnZ, homeResident, forceNewIdentity, approachTargetX, approachTargetY, approachTargetZ)
+    local function registerLive(barterer, zombie, gun, knife, record)
+        spawnCounter = spawnCounter + 1
+        record.bartererId = barterer.id
+        record.seq = BarteringTiming.now() + spawnCounter
+        record.zid = zombie:getOnlineID()
+        record.unloaded = nil
+        record.x, record.y, record.z = zombie:getX(), zombie:getY(), zombie:getZ()
+        record.ammo = record.ammo or (gun:getMagazineType()
+            and gun:getMaxAmmo() * (BarterSpawn.STARTING_MAGAZINES + 1) - ZombRand(6) or BarterSpawn.STARTING_AMMO - ZombRand(6))
+        Bartering.getLiveRecords()[barterer.id] = record
+        Bartering.bumpLiveRev(record)
+        Bartering.transmitGlobalNow(Bartering.Registries.Live)
+        state.serverZombies[barterer.id] = zombie
+        state.serverZombieIds[zombie] = barterer.id
+        state.serverItems[barterer.id] = { gun = gun, knife = knife }
+        state.serverState[barterer.id] = nil
+        print(string.format("[Bartering][MP] registered %s zid=%s seq=%s resident=%s isServer=%s",
+            tostring(barterer.id), tostring(record.zid), tostring(record.seq),
+            tostring(record.homeResident == true), tostring(isServer())))
+        return record
+    end
+
+    local function spawnBarterer(player, barterer, spawnX, spawnY, spawnZ, homeResident, forceNewIdentity, approachTargetX, approachTargetY, approachTargetZ, routeTrip)
         clearBartererDeath(barterer.id)
         despawnBarterer(barterer.id)
         Bartering.setRegistryRecord(Bartering.Registries.ReturningHome, barterer.id, nil)
 
         local targetX = spawnX
         local targetY = spawnY
-        if not targetX or not targetY then
-            local dx = player:getX() - barterer.x
-            local dy = player:getY() - barterer.y
-            local distance = math.sqrt(dx * dx + dy * dy)
-            if distance == 0 then
-                dx = 1
-                dy = 0
-                distance = 1
-            end
-            targetX = math.floor(player:getX() - dx / distance * 20)
-            targetY = math.floor(player:getY() - dy / distance * 20)
-        end
-        local z = spawnZ or player:getZ()
 
-        local departureAtMs = 0
-        if not homeResident then
-            departureAtMs = BarteringTiming.createCalledInDeparture()
+        local z = homeResident and (spawnZ or barterer.z) or 0
+
+        if homeResident then
+            BarteringReturn.clearPostIntruders(targetX, targetY, z,
+                BarteringReturn.RESIDENT_POST_CLEAR_DISTANCE, nil)
         end
 
         local zombie, gun, knife, x, y = createBartererZombie({
             barterer = barterer,
-            master = player,
             spawnX = targetX,
             spawnY = targetY,
             spawnZ = z,
-            calledIn = not homeResident,
-            departureAtMs = departureAtMs,
             bartererState = "Approach",
             useless = false,
             forceNewIdentity = forceNewIdentity,
         })
         if not zombie then
-            return
+            return nil
         end
+
+        local record = registerLive(barterer, zombie, gun, knife, {
+            homeResident = homeResident == true,
+            hasArrived = homeResident == true,
+            returningToPost = false,
+            returningAfterMeeting = false,
+            postX = homeResident and x or nil,
+            postY = homeResident and y or nil,
+            postZ = homeResident and z or nil,
+            approachTargetX = approachTargetX,
+            approachTargetY = approachTargetY,
+            approachTargetZ = approachTargetZ,
+            routeStartX = routeTrip and routeTrip.startX or nil,
+            routeStartY = routeTrip and routeTrip.startY or nil,
+            routeTargetX = routeTrip and routeTrip.targetX or nil,
+            routeTargetY = routeTrip and routeTrip.targetY or nil,
+            routeStandoff = routeTrip and routeTrip.standoff or nil,
+            departureAtHours = (not homeResident) and BarteringTiming.createCalledInDepartureHours() or nil,
+            master = (not homeResident) and player and player:getUsername() or nil,
+            state = "Approach",
+        })
 
         if homeResident then
             Bartering.setRegistryRecord(Bartering.Registries.Call, barterer.id, nil)
             requestLeftoverCleanup(barterer.id, x, y, z)
-        else
-            Bartering.setRegistryRecord(Bartering.Registries.Call, barterer.id, {
-                barterer = barterer,
-                playerName = player and player:getUsername() or nil,
-                playerOnlineId = player and player:getOnlineID() or nil,
-                startedAtMs = getTimeInMillis(),
-                targetX = approachTargetX,
-                targetY = approachTargetY,
-                targetZ = approachTargetZ,
-                arrivalModeLocation = approachTargetX ~= nil and approachTargetY ~= nil and approachTargetZ ~= nil,
-                arrivalAtMs = departureAtMs,
-            })
         end
 
-        trackBarterer({
-            zombie = zombie,
-            bartererId = barterer.id,
-            master = player,
-            gun = gun,
-            knife = knife,
-            projectileCount = Bartering.getBartererWeapon(barterer.id).projectileCount or 1,
-            homeResident = homeResident,
-            hasArrived = homeResident,
-            postX = homeResident and x,
-            postY = homeResident and y,
-            postZ = homeResident and z,
-            approachTargetX = approachTargetX,
-            approachTargetY = approachTargetY,
-            approachTargetZ = approachTargetZ,
-            departureAtMs = homeResident and nil or departureAtMs,
-        })
-
-        if player and not spawnX then
-            player:Say(Bartering.getBartererDisplayName(barterer.id) .. " is approaching")
+        if routeTrip and routeTrip.route and routeTrip.route.status == "ready" then
+            print(string.format(
+                "[Bartering][Call] %s spawned at %d,%d, %.0f of %.0f tiles along its road route; following it before heading to the meetup",
+                tostring(barterer.id), x, y,
+                BarteringIntercept.nearestAlongRoute(routeTrip.route, x + 0.5, y + 0.5), routeTrip.route.total))
         end
-    end
 
-    local function unloadEntry(entry, zombie)
-        config.calls.persistActiveCalledInEntry(entry, zombie, true)
-        config.combat.clearCombatTask(entry)
-        config.combat.releaseBartererThreats(zombie)
-        log(zombie, "no player in range; unloading until a player returns", "Unloaded")
-        leftoverCleanupPending[entry.bartererId] = nil
-        despawnZombie(zombie)
+        return record
     end
 
     local function spawnResidentBarterer(player, barterer, worldAgeHours)
@@ -344,12 +407,13 @@ function BarterSpawn.new(config)
         if lifeState.returningHomeAt ~= nil then
             lifeState.returningHomeAt = nil
             Bartering.markBartererDataDirty(barterer.id)
+            Bartering.clearReturningHomeKnowledge(barterer.id)
         end
 
         local readyToRespawn = lifeState.respawnAt ~= nil and worldAgeHours >= lifeState.respawnAt
         Bartering.ensureBartererIdentity(barterer.id, readyToRespawn)
-        local x, y, z = Bartering.pickSpawnLocationNear(barterer, player, BarterSpawn.LOAD_DISTANCE_SQ)
-        spawnBarterer(player, barterer, x, y, z, true, readyToRespawn)
+        Bartering.ensureBartererHome(barterer)
+        spawnBarterer(player, barterer, barterer.x, barterer.y, barterer.z, true, readyToRespawn)
     end
 
     local function updateSpawns()
@@ -364,8 +428,7 @@ function BarterSpawn.new(config)
         scanTicks = SPAWN_SCAN_INTERVAL_TICKS
 
         local worldAgeHours = getGameTime():getWorldAgeHours()
-        local now = getTimeInMillis()
-        local activeCalledIn = ModData.getOrCreate(Bartering.Registries.ActiveCalledIn)
+        local now = BarteringTiming.now()
 
         for _, barterer in pairs(Bartering.Barterers) do
             if not hasTrackedBarterer(barterer.id)
@@ -373,13 +436,17 @@ function BarterSpawn.new(config)
                 and not config.calls.hasPendingCall(barterer.id) then
 
                 local returning = Bartering.getRegistryRecord(Bartering.Registries.ReturningHome, barterer.id)
-                if returning and returning.arriveHomeAtMs and now >= tonumber(returning.arriveHomeAtMs) then
-                    Bartering.setRegistryRecord(Bartering.Registries.ReturningHome, barterer.id, nil)
-                    returning = nil
+                if returning and returning.arriveHomeAtMs then
+                    if now >= tonumber(returning.arriveHomeAtMs) then
+                        Bartering.setRegistryRecord(Bartering.Registries.ReturningHome, barterer.id, nil)
+                        returning = nil
+                    else
+                        returning.remainingMs = tonumber(returning.arriveHomeAtMs) - now
+                    end
                 end
 
                 if not returning then
-                    local record = activeCalledIn[barterer.id]
+                    local record = Bartering.getLiveRecord(barterer.id)
                     if record then
                         if isPlayerNearTile(record.x, record.y, BarterSpawn.LOAD_DISTANCE_SQ) then
                             config.calls.spawnRestoredCalledInBarterer(barterer, record,
@@ -407,13 +474,12 @@ function BarterSpawn.new(config)
             return
         end
 
-        state.barterers = {}
         config.calls.bootstrapPersistedCalls()
-        config.calls.pruneActiveCalledInRecords()
+        config.calls.pruneLiveRecords()
 
         leftoverCleanupPending = {}
         for _, barterer in pairs(Bartering.Barterers) do
-            Bartering.restoreBartererHome(barterer)
+            Bartering.ensureBartererHome(barterer)
             leftoverCleanupPending[barterer.id] = true
         end
 
@@ -422,7 +488,10 @@ function BarterSpawn.new(config)
     end
 
     local function resetBootstrap()
-        state.barterers = {}
+        state.serverZombies = {}
+        state.serverZombieIds = {}
+        state.serverItems = {}
+        state.serverState = {}
         state.residentsInitialized = false
         config.calls.resetState()
     end
@@ -430,22 +499,25 @@ function BarterSpawn.new(config)
     return {
         despawnZombie = despawnZombie,
         despawnBarterer = despawnBarterer,
-        despawnBartererEntry = despawnBartererEntry,
+        removeLive = removeLive,
         untrackEntry = untrackEntry,
-        trackBarterer = trackBarterer,
+        attachController = attachController,
         hasTrackedBarterer = hasTrackedBarterer,
-        ownsZombie = ownsZombie,
-        releaseLostEntry = releaseLostEntry,
+        ownsServerZombie = ownsServerZombie,
+        releaseLost = releaseLost,
         noteLeftover = noteLeftover,
-        unloadEntry = unloadEntry,
+        unloadBarterer = unloadBarterer,
+        markUnloaded = markUnloaded,
         createBartererZombie = createBartererZombie,
+        registerLive = registerLive,
         spawnBarterer = spawnBarterer,
-        deprovisionBarterer = deprovisionBarterer,
         markBartererDeath = markBartererDeath,
         clearBartererDeath = clearBartererDeath,
         updateSpawns = updateSpawns,
         bootstrap = bootstrap,
         resetBootstrap = resetBootstrap,
+        probeOnZombieCreate = probeOnZombieCreate,
+        probeHomes = probeHomes,
     }
 end
 

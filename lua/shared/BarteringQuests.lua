@@ -2,7 +2,8 @@ Bartering = Bartering or {}
 Bartering.Quests = Bartering.Quests or {}
 
 local BarteringTiming = require "BarteringTiming"
-local InventoryItemFactory = _G["InventoryItemFactory"]
+local BarteringDialogue = require "BarteringDialogue"
+local instanceItem = _G["instanceItem"]
 local getGameTime = _G["getGameTime"]
 local ArrayList = _G["ArrayList"]
 
@@ -12,10 +13,13 @@ local Quests = Bartering.Quests
 
 Quests.REWARD = 75
 Quests.DEFAULT_COOLDOWN_DAYS = 7
+Quests.DEFAULT_TIME_LIMIT_DAYS = 3
 Quests.MIN_ROOM_AREA = 9
 Quests.BUILDING_SAMPLES = 600
 Quests.THEMED_BUILDING_SAMPLES = 1000
 Quests.COUPON_ITEM = "Bartering.Coupon"
+Quests.CLOTHING_QUEST_CHANCE = 25
+Quests.CLOTHING_ROOM = "bedroom"
 Quests.COUPON_VALUE = 10
 
 Quests.Towns = {
@@ -52,6 +56,7 @@ Quests.ExcludedRooms = {
     sodatruck = true,
     horsebox = true,
     newsroom = true,
+    schoolstorage = true,
 }
 
 Quests.PersonalRooms = {
@@ -108,6 +113,7 @@ Quests.RoomLabels = {
     fishchipskitchen = "fish and chip shop kitchen",
     clothesstore = "clothes store",
     clothingstore = "clothes store",
+    morgue = "morgue",
     shoestore = "shoe store",
     toolstore = "hardware store",
     gunstore = "gun store",
@@ -160,7 +166,6 @@ Quests.RoomLabels = {
     theatrestorage = "theatre store room",
     medicalstorage = "medical storage",
     hospitalstorage = "hospital store room",
-    schoolstorage = "school store room",
     policestorage = "police store room",
     firestorage = "fire station store room",
     armystorage = "army store room",
@@ -171,7 +176,7 @@ Quests.RoomLabels = {
     generalstorestorage = "back room of a general store",
     cornerstorestorage = "back room of a corner store",
     departmentstorage = "back room of a department store",
-    dinerbackroom = "the backroom of a restaurant",
+    dinerbackroom = "backroom of a restaurant",
     electronicsstorage = "back room of an electronics store",
     furniturestorage = "furniture store back room",
     jewelrystorage = "jewelry store back room",
@@ -206,17 +211,6 @@ Quests.RoomLabels = {
     locker = "locker room",
 }
 
-Quests.ToolSentimentLine = "There's none other like it."
-
-Quests.SentimentLines = {
-    "It means a lot to me.",
-    "Had that thing since before any of this started.",
-    "Never got the chance to go back for it.",
-    "It's about the last thing I've got left from that life.",
-    "Lost enough already without losing that too.",
-    "I've replaced everything else twice over. Not that.",
-    "You could say I'm attached to it.",
-}
 
 Quests.VideoTitles = {
     "Breaking Points: Directors Cut",
@@ -274,14 +268,39 @@ Quests.MedicineMeds = {
     { itemName = "Panalex", complaint = "It's hard to get anything done when you're hurting." },
 }
 
-Quests.LiquorItemType = "Base.WhiskeyFull"
+Quests.LiquorItemType = "Base.Whiskey"
 Quests.LiquorItemName = "Bottle of Rare Bourbon"
 
-Quests.NecklaceItems = {
-    { itemType = "Base.Necklace_Gold",   familyTie = "mother" },
-    { itemType = "Base.Necklace_Silver", familyTie = "grandmother" },
-    { itemType = "Base.Necklace_Pearl",  familyTie = "daughter" },
+Quests.ClothingItems = {
+    { itemType = "Base.Hat_BaseballCap", label = "Baseball Cap" },
+    { itemType = "Base.Hat_BaseballCapBlue", label = "Baseball Cap" },
+    { itemType = "Base.Hat_BaseballCapRed", label = "Baseball Cap" },
+    { itemType = "Base.Hat_BaseballCapGreen", label = "Baseball Cap" },
+    { itemType = "Base.Hat_BaseballCapKY", label = "Baseball Cap" },
+    { itemType = "Base.Hat_Cowboy", label = "Cowboy Hat" },
+    { itemType = "Base.Hat_Fedora", label = "Fedora" },
+    { itemType = "Base.Hat_Fedora_Delmonte", label = "Fedora" },
+    { itemType = "Base.Hat_BucketHat", label = "Bucket Hat" },
+    { itemType = "Base.Hat_Beany", label = "Beanie" },
+    { itemType = "Base.Jacket_Varsity", label = "Varsity Jacket" },
+    { itemType = "Base.Jacket_LeatherIronRodent", label = "Leather Jacket" },
+    { itemType = "Base.Jacket_LeatherBarrelDogs", label = "Leather Jacket" },
+    { itemType = "Base.Jacket_LeatherWildRacoons", label = "Leather Jacket" },
 }
+
+Quests.NecklaceItems = {
+    "Base.Necklace_Gold",
+    "Base.Necklace_GoldRuby",
+    "Base.Necklace_GoldDiamond",
+    "Base.Necklace_Silver",
+    "Base.Necklace_SilverSapphire",
+    "Base.Necklace_SilverDiamond",
+    "Base.Necklace_Pearl",
+    "Base.NecklaceLong_Gold",
+    "Base.NecklaceLong_Silver",
+}
+
+Quests.NecklaceTies = { "mother", "grandmother", "daughter" }
 
 Quests.NecklaceTieLabels = {
     mother    = "Mom's Necklace",
@@ -296,6 +315,66 @@ Quests.PictureItems = {
     { itemType = "Base.KatePic",      familyTie = "sister" },
 }
 
+Quests.GenericPlaceNames = {
+    ["apartment buildings"] = true,
+    ["appartment complex"] = true,
+    ["auto shop"] = true,
+    ["automotive store"] = true,
+    ["boxing gym"] = true,
+    ["burger shop"] = true,
+    ["burger stall"] = true,
+    ["bus station"] = true,
+    ["butchering stand"] = true,
+    ["chinese restaurant"] = true,
+    ["clothing store"] = true,
+    ["clothing stores"] = true,
+    ["corner store"] = true,
+    ["courthouse"] = true,
+    ["cyber cafe"] = true,
+    ["driving school"] = true,
+    ["electrical substation"] = true,
+    ["elementary school"] = true,
+    ["farming shop"] = true,
+    ["farming store"] = true,
+    ["ferry ticket office"] = true,
+    ["fire department"] = true,
+    ["fish & seafood stands"] = true,
+    ["fishing gear stand"] = true,
+    ["food stall"] = true,
+    ["forest cabins"] = true,
+    ["furniture store"] = true,
+    ["funeral chapel"] = true,
+    ["gated communities"] = true,
+    ["gated community"] = true,
+    ["garage for lease"] = true,
+    ["general store"] = true,
+    ["hardware store"] = true,
+    ["hot dog stands"] = true,
+    ["ice cream stand"] = true,
+    ["italian restaurant"] = true,
+    ["large suburbs"] = true,
+    ["leather workshop"] = true,
+    ["liquor store"] = true,
+    ["medial clinic"] = true,
+    ["movie rental"] = true,
+    ["music store at the mall"] = true,
+    ["office complex"] = true,
+    ["pharmacy's medical storage"] = true,
+    ["piano store"] = true,
+    ["pottery workshop"] = true,
+    ["residential area"] = true,
+    ["snacks stall"] = true,
+    ["soup kitchen"] = true,
+    ["sporting goods store"] = true,
+    ["storage units"] = true,
+    ["sushi restaurant"] = true,
+    ["tailor"] = true,
+    ["train station"] = true,
+    ["water tower"] = true,
+    ["welding workshop"] = true,
+    ["wrecking yard"] = true,
+}
+
 Quests.RoomThemes = {
     movierental = "video",
     musicstore = "music",
@@ -307,9 +386,31 @@ Quests.RoomThemes = {
     hospitalroom = "medicine",
 }
 
+Quests.MedicineStorageRoom = "medicalstorage"
+
+Quests.BuildingRoomSignatures = {
+    firestorage = "fire department",
+    policestorage = "police station",
+    armystorage = "army base",
+}
+
+function Quests.getBuildingKindFromName(name)
+    local lower = name:lower()
+    if lower:match("fire department") or lower:match("fire station") then
+        return "fire department"
+    end
+    if lower:match("police") then
+        return "police station"
+    end
+    if lower:match("army") then
+        return "army base"
+    end
+    return nil
+end
+
 Quests.NeverRequestedItems = {
     "Bartering.Coupon",
-    "Base.EmptyNotebook",
+    "Base.Notebook",
 }
 
 Quests.NeverRequestedPatterns = {
@@ -333,14 +434,7 @@ for key in pairs(Bartering.Values.NonBarterableItems) do
 end
 
 Quests.ItemPool = {
-    "Base.Hammer",
-    "Base.HuntingKnife",
-    "Base.Screwdriver",
-    "Base.Saw",
-    "Base.Axe",
-    "Base.BaseballBat",
     "Base.Journal",
-    "Base.FishingRod",
 }
 
 function Quests.getTownAt(x, y)
@@ -354,6 +448,13 @@ end
 
 function Quests.getRoomLabel(roomName)
     return Quests.RoomLabels[roomName] or roomName
+end
+
+function Quests.getReferencedName(name)
+    if Quests.GenericPlaceNames[name:lower()] then
+        return "the " .. name
+    end
+    return name
 end
 
 function Quests.getIndefiniteArticle(label)
@@ -372,7 +473,7 @@ end
 function Quests.getNamedLocation(quest)
     if quest.namedId then
         for _, location in ipairs(NamedPlaces.getLocations()) do
-            if location.id == quest.namedId then
+            if location.id == quest.namedId and (location.z or 0) == (quest.z or 0) then
                 return location
             end
         end
@@ -380,7 +481,7 @@ function Quests.getNamedLocation(quest)
     local closest = nil
     local closestDist = nil
     for _, location in ipairs(NamedPlaces.getLocations()) do
-        if location.townId == quest.townId then
+        if location.townId == quest.townId and (location.z or 0) == (quest.z or 0) then
             local dx = math.abs(location.x - quest.x)
             local dy = math.abs(location.y - quest.y)
             if dx <= location.radius and dy <= location.radius then
@@ -395,23 +496,68 @@ function Quests.getNamedLocation(quest)
     return closest
 end
 
-function Quests.getPlaceReference(quest)
+function Quests.getPlaceLabel(quest, player)
+    return Quests.getPlaceReference(quest, player, true)
+end
+
+function Quests.getPlaceReference(quest, player, bare)
+    if quest.theme == "clothing" then
+        return bare and BarteringDialogue.QuestLabel.momsHouseTitle or BarteringDialogue.QuestLabel.momsHouse
+    end
+    if player and not quest.theme and Quests.isPersonalRoom(quest.roomName)
+            and Quests.hasNecklaceUsed(player, quest.bartererId) then
+        local tie = (Quests.hashQuestId(quest) % 2 == 0) and "brother" or "sister"
+        return tie .. "'s house"
+    end
+    if quest.theme == "necklace" or quest.theme == "picture" then
+        local roomLabel = Quests.getRoomLabel(quest.roomName)
+        if bare then
+            return roomLabel
+        end
+        return "in the " .. roomLabel
+    end
+    if quest.theme == "medicine" and quest.buildingContext then
+        return Quests.getReferencedName(quest.buildingContext) .. "'s " .. Quests.getRoomLabel(quest.roomName)
+    end
     local named = Quests.getNamedLocation(quest)
     if named then
         if quest.theme == "medicine" then
-            local roomLabel = Quests.getRoomLabel(quest.roomName)
-            if roomLabel then
-                return string.format("%s's %s", named.name, roomLabel)
-            end
+            return bare and named.name or Quests.getReferencedName(named.name)
         end
-        if (quest.z or 0) > 0 and quest.namedFloor0Room and quest.namedFloor0Room ~= quest.roomName then
+        if (quest.z or 0) > 0 then
+            local base = named.name
+            local marker
+            local pos = 0
+            while true do
+                local p = base:find(" above ", pos + 1, true)
+                if not p then
+                    break
+                end
+                marker = p
+                pos = p
+            end
+            if marker then
+                base = base:sub(marker + 7)
+            else
+                return bare and named.name or Quests.getReferencedName(named.name)
+            end
             local label = Quests.getRoomLabel(quest.roomName)
             if label == "office" then
-                return string.format("the offices above %s", named.name)
+                return (bare and "" or "the ") .. "offices above " .. base
             end
-            return string.format("the %s above %s", label, named.name)
+            return string.format("%s%s above %s", bare and "" or "the ", label, base)
         end
-        return named.name
+        return bare and named.name or Quests.getReferencedName(named.name)
+    end
+    if quest.theme == "medicine" then
+        local roomLabel = Quests.getRoomLabel(quest.roomName)
+        if bare then
+            return roomLabel
+        end
+        return "in " .. Quests.getIndefiniteArticle(roomLabel) .. " " .. roomLabel
+    end
+    if bare then
+        return Quests.getRoomLabel(quest.roomName)
     end
     return Quests.getRoomReference(quest.roomName)
 end
@@ -430,6 +576,14 @@ function Quests.isUsableRoom(roomDef)
         return false
     end
     return roomDef:getArea() >= Quests.MIN_ROOM_AREA
+end
+
+function Quests.isClothingRoom(roomDef)
+    return roomDef:getName() == Quests.CLOTHING_ROOM
+end
+
+function Quests.isClothingQuestAvailable(bartererId)
+    return not Bartering.ensureBartererIdentity(bartererId).clothingQuestDone
 end
 
 function Quests.getThemeForRoom(roomName)
@@ -478,89 +632,139 @@ end
 
 function Quests.getSentimentLine(quest)
     if quest.itemType and Quests.isToolOrWeapon(quest.itemType) then
-        return Quests.ToolSentimentLine
+        return BarteringDialogue.Sentiment.tool
     end
-    return Quests.pickQuestLine(quest, Quests.SentimentLines)
+    return Quests.pickQuestLine(quest, BarteringDialogue.Sentiment.lines)
 end
 
-function Quests.getFlavorLine(quest)
-    local place = Quests.getPlaceReference(quest)
+function Quests.getFlavorLine(quest, player)
+    local place = Quests.getPlaceReference(quest, player)
+    local flavor = BarteringDialogue.QuestFlavor
+
+    if quest.theme == "clothing" then
+        return string.format(flavor.clothing, quest.itemLabel, place, quest.townName)
+    end
     if quest.theme == "video" then
-        return Quests.pickQuestLine(quest, {
-            string.format("See if %s in %s still has a copy of '%s' on VHS. I never had a chance to watch it.", place, quest.townName, quest.title),
-            string.format("Ask around %s in %s for a copy of '%s'. It reminds me of the old days.", place, quest.townName, quest.title),
-        })
+        return string.format(Quests.pickQuestLine(quest, flavor.video), place, quest.townName, quest.title)
     end
     if quest.theme == "music" then
-        return Quests.pickQuestLine(quest, {
-            string.format("Get me a copy of '%s' from %s in %s. I never had a chance to listen to it.", quest.title, place, quest.townName),
-            string.format("Ask around %s in %s for a copy of '%s'. It reminds me of the old days.", place, quest.townName, quest.title),
-        })
+        local line = Quests.pickQuestLine(quest, flavor.music)
+        if line == flavor.music[1] then
+            return string.format(line, quest.title, place, quest.townName)
+        end
+        return string.format(line, place, quest.townName, quest.title)
     end
     if quest.theme == "liquor" then
-        return string.format(
-            "I need a drink, but I only drink the finest bourbons. Find me a %s from %s in %s and I'll make it worth your while.",
-            quest.itemLabel:lower(), place, quest.townName)
+        return string.format(flavor.liquor, quest.itemLabel:lower(), place, quest.townName)
     end
     if quest.theme == "medicine" then
-        return string.format(
-            "I need a bottle of %s. %s There should be some at %s in %s. Bring it back and I'll make it worth your while.",
-            quest.itemLabel, quest.complaint, place, quest.townName)
+        return string.format(flavor.medicine, quest.itemLabel, quest.complaint, place, quest.townName)
     end
+    if quest.theme == "necklace" then
+        return string.format(Quests.pickQuestLine(quest, flavor.necklace),
+            quest.townName, quest.itemLabel:lower(), Quests.getRoomLabel(quest.roomName))
+    end
+    if quest.theme == "picture" then
+        return string.format(Quests.pickQuestLine(quest, flavor.picture),
+            quest.pictureTie, Quests.getRoomLabel(quest.roomName), quest.townName)
+    end
+
     local sentiment = Quests.getSentimentLine(quest)
-    if Quests.isPersonalRoom(quest.roomName) then
-        return string.format(
-            "I had a place over in %s before all this. My %s is still sitting in the %s there. %s Bring it back to me.",
-            quest.townName, quest.itemLabel:lower(), Quests.getRoomLabel(quest.roomName), sentiment)
+    local template = flavor.anywhere
+    if Quests.isPersonalRoom(quest.roomName)
+            and player and Quests.hasNecklaceUsed(player, quest.bartererId) then
+        template = flavor.personalRoom
+    elseif Quests.getNamedLocation(quest) then
+        template = flavor.namedPlace
     end
-    if Quests.getNamedLocation(quest) then
-        return string.format(
-            "I left my %s at %s in %s. %s Bring it back to me.",
-            quest.itemLabel:lower(), place, quest.townName, sentiment)
-    end
-    return string.format(
-        "I left my %s somewhere in %s in %s. %s Bring it back to me.",
-        quest.itemLabel:lower(), place, quest.townName, sentiment)
+    return string.format(template, quest.itemLabel:lower(), place, quest.townName, sentiment)
 end
 
-function Quests.getReminderLine(quest, hasItem)
+function Quests.getReminderLine(quest, hasItem, player)
+    local reminder = BarteringDialogue.QuestReminder
+    local deadline = ""
+    local remaining = Quests.getRemainingHours(quest)
+    if remaining and not hasItem then
+        deadline = string.format(reminder.deadline, BarteringTiming.formatGameHours(remaining))
+    end
+
     if hasItem then
         local label
         if quest.theme == "video" or quest.theme == "music" then
-            label = string.format("copy of '%s'", quest.title)
-        elseif quest.theme == "medicine" then
+            label = string.format(BarteringDialogue.QuestLabel.recording, quest.title)
+        elseif quest.theme == "medicine" or quest.theme == "clothing" then
             label = quest.itemLabel
+        elseif quest.theme == "picture" then
+            label = string.format(BarteringDialogue.QuestLabel.picture, quest.pictureTie)
         else
             label = quest.itemLabel:lower()
         end
-        return string.format("That's the one. Hand over my %s and we're square.", label)
+        return string.format(reminder.handOver, label)
     end
-    local place = Quests.getPlaceReference(quest)
+
+    local place = Quests.getPlaceReference(quest, player)
+    if quest.theme == "clothing" then
+        return string.format(reminder.clothing, quest.itemLabel, place, quest.townName) .. deadline
+    end
     if quest.theme == "video" or quest.theme == "music" then
-        return string.format("Still nothing? A copy of '%s' from %s in %s. It's marked on your map.", quest.title, place, quest.townName)
+        return string.format(reminder.recording, quest.title, place, quest.townName) .. deadline
     end
     if quest.theme == "liquor" then
-        return string.format("Still nothing? My bourbon from %s in %s. It's marked on your map.", place, quest.townName)
+        return string.format(reminder.liquor, place, quest.townName) .. deadline
     end
     if quest.theme == "medicine" then
-        return string.format("Still nothing? I need the %s from %s in %s. It's marked on your map.", quest.itemLabel, place, quest.townName)
+        return string.format(reminder.medicine, quest.itemLabel, place, quest.townName) .. deadline
+    end
+    if quest.theme == "necklace" then
+        return string.format(reminder.necklace, quest.itemLabel:lower(),
+            Quests.getRoomLabel(quest.roomName), quest.townName) .. deadline
+    end
+    if quest.theme == "picture" then
+        return string.format(reminder.picture, quest.pictureTie,
+            Quests.getRoomLabel(quest.roomName), quest.townName) .. deadline
     end
     if Quests.isPersonalRoom(quest.roomName) then
-        return string.format("Still nothing? My old place in %s, the %s. It's marked on your map.", quest.townName, Quests.getRoomLabel(quest.roomName))
+        local placeDesc
+        if player and Quests.hasNecklaceUsed(player, quest.bartererId) then
+            placeDesc = string.format(reminder.knownPlace, place, quest.townName)
+        else
+            placeDesc = string.format(reminder.oldPlace, quest.townName, Quests.getRoomLabel(quest.roomName))
+        end
+        return string.format(reminder.personalRoom, placeDesc) .. deadline
     end
-    return string.format("Still nothing? %s in %s. It's marked on your map.", place, quest.townName)
+    return string.format(reminder.generic, place, quest.townName) .. deadline
+end
+function Quests.getPlayerState(player)
+    local state = Bartering.getPlayerTable(player, "BarteringQuests")
+    state.active = state.active or {}
+    state.cooldown = state.cooldown or {}
+    state.necklaceUsed = state.necklaceUsed or {}
+    return state
 end
 
-function Quests.getPlayerState(player)
-    local modData = player:getModData()
-    modData.BarteringQuests = modData.BarteringQuests or {}
-    modData.BarteringQuests.active = modData.BarteringQuests.active or {}
-    modData.BarteringQuests.cooldown = modData.BarteringQuests.cooldown or {}
-    return modData.BarteringQuests
+function Quests.getTimeLimitHours()
+    return Bartering.getSandboxNumber("QuestTimeLimitDays", Quests.DEFAULT_TIME_LIMIT_DAYS) * 24
+end
+
+function Quests.getRemainingHours(quest)
+    local limit = Quests.getTimeLimitHours()
+    if limit <= 0 then
+        return nil
+    end
+    return BarteringTiming.remainingHours(quest.acceptedAt + limit)
+end
+
+function Quests.isExpired(quest)
+    local remaining = Quests.getRemainingHours(quest)
+    return remaining ~= nil and remaining <= 0
 end
 
 function Quests.getActive(player, bartererId)
-    return Quests.getPlayerState(player).active[bartererId]
+    local quest = Quests.getPlayerState(player).active[bartererId]
+    if quest and Quests.isExpired(quest) then
+        return nil
+    end
+    return quest
 end
 
 function Quests.getCooldownHours()
@@ -572,7 +776,7 @@ function Quests.getCooldownRemainingHours(player, bartererId)
 end
 
 function Quests.canRequest(player, bartererId)
-    if not Bartering.hasMetBarterer(player, bartererId) then
+    if not Bartering.isBartererKnown(player, bartererId) then
         return false
     end
     if Quests.getActive(player, bartererId) then
@@ -582,7 +786,7 @@ function Quests.canRequest(player, bartererId)
 end
 
 function Quests.getItemLabel(itemType)
-    return InventoryItemFactory.CreateItem(itemType):getDisplayName()
+    return instanceItem(itemType):getDisplayName()
 end
 
 function Quests.buildItemName(bartererId, itemLabel)
@@ -611,7 +815,7 @@ function Quests.acceptsCoupon(item, bartererId)
 end
 
 function Quests.createCoupon(bartererId)
-    local coupon = InventoryItemFactory.CreateItem(Quests.COUPON_ITEM)
+    local coupon = instanceItem(Quests.COUPON_ITEM)
     coupon:setName(Quests.buildCouponName(bartererId))
     coupon:getModData().BarteringCouponBarterer = bartererId
     return coupon

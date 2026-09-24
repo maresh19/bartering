@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transition>
+	<transitionTo>staggerback-knockeddown</transitionTo>
+	<conditions>
+		<isTrue>bKnockedDown</isTrue>
+		<isFalse>bOnFloor</isFalse>
+		<isFalse>hashitreaction</isFalse>
+		<compare op="==" a="playerAttackPosition" b="FRONT" />
+		<isFalse>Barterer</isFalse>
+	</conditions>
+</transition>

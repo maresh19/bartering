@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transition>
+	<transitionTo>staggerback-knockeddown-ragdoll</transitionTo>
+	<conditions>
+		<isTrue>bStaggerBack</isTrue>
+		<isTrue>bKnockedDown</isTrue>
+		<isTrue>usePhysicHitReaction</isTrue>
+		<isTrue>canRagdoll</isTrue>
+		<isFalse>Barterer</isFalse>
+	</conditions>
+</transition>

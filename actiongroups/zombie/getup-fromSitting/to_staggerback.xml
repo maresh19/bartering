@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transition>
+	<transitionTo>staggerback</transitionTo>
+	<conditions>
+		<isTrue>bStaggerBack</isTrue>
+		<isFalse>bOnFloor</isFalse>
+		<isFalse>useRagdollVehicle</isFalse>
+		<isFalse>isVehicleCollision</isFalse>
+		<isFalse>Barterer</isFalse>
+	</conditions>
+</transition>

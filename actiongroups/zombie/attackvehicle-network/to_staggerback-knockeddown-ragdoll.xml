@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transitions>
+	<transition>
+		<transitionTo>staggerback-knockeddown-ragdoll</transitionTo>
+		<conditions>
+			<isTrue>bKnockedDown</isTrue>
+			<isFalse>bOnFloor</isFalse>
+			<isFalse>hashitreaction</isFalse>
+			<compare op="==" a="playerAttackPosition" b="BACK" />
+			<isTrue>usePhysicHitReaction</isTrue>
+		<isFalse>Barterer</isFalse>
+		</conditions>
+	</transition>
+	<transition>
+		<transitionTo>staggerback-knockeddown-ragdoll</transitionTo>
+		<conditions>
+			<isTrue>bKnockedDown</isTrue>
+			<isFalse>bOnFloor</isFalse>
+			<isFalse>hashitreaction</isFalse>
+			<compare op="==" a="playerAttackPosition" b="FRONT" />
+			<isTrue>usePhysicHitReaction</isTrue>
+		<isFalse>Barterer</isFalse>
+		</conditions>
+	</transition>
+</transitions>

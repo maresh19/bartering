@@ -20,7 +20,7 @@ Bartering.Weapons = {
         weaponType = "Rifle",
         primaryType = "rifle",
         projectileCount = 1,
-        ammoItem = "Base.223Bullets",
+        ammoItem = "Base.556Bullets",
     },
 }
 

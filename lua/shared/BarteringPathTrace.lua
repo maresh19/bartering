@@ -1,6 +1,7 @@
 local events = _G["Events"]
 local isClient = _G["isClient"]
-local getTimeInMillis = _G["getTimeInMillis"]
+
+local BarteringTiming = require "BarteringTiming"
 
 local BarteringPathTrace = {}
 
@@ -14,6 +15,12 @@ local nextFlushAt = 0
 
 local function tracing()
     return Bartering.getSandboxBoolean("DebugMode", false)
+end
+
+function BarteringPathTrace.log(...)
+    if tracing() then
+        print(...)
+    end
 end
 
 local function traceKey(zombie)
@@ -39,7 +46,7 @@ local function newRecord(id, zombie)
         flapPrints = {},
         goalConsumed = 0,
         goalLatency = 0,
-        windowStartMs = getTimeInMillis(),
+        windowStartMs = BarteringTiming.now(),
         windowStartX = zombie:getX(),
         windowStartY = zombie:getY(),
     }
@@ -113,9 +120,10 @@ function BarteringPathTrace.driveStop(zombie, reason)
     bump(record.swallowed, reason)
     if record.goalPendingTicks == TUNE.STALE_GOAL_TICKS then
         print(string.format(
-            "[Bartering][Path] %s | goal %d,%d,%d from %s unconsumed for %d drive ticks | blocked at %s pos=%.2f,%.2f",
-            displayName(record), record.goalX, record.goalY, record.goalZ,
-            record.goalSource, record.goalPendingTicks, reason,
+            "[Bartering][Path] %s | goal %s,%s,%s from %s unconsumed for %d drive ticks | blocked at %s pos=%.2f,%.2f",
+            displayName(record),
+            tostring(record.goalX), tostring(record.goalY), tostring(record.goalZ),
+            tostring(record.goalSource), record.goalPendingTicks, tostring(reason),
             zombie:getX(), zombie:getY()))
     end
 end
@@ -286,7 +294,7 @@ local function flushRecord(record, nowMs)
 end
 
 local function flushAll()
-    local nowMs = getTimeInMillis()
+    local nowMs = BarteringTiming.now()
     local reported = 0
     for id, record in pairs(records) do
         if flushRecord(record, nowMs) then
@@ -308,7 +316,7 @@ local function onTick()
     if not tracing() then
         return
     end
-    local nowMs = getTimeInMillis()
+    local nowMs = BarteringTiming.now()
     if nowMs < nextFlushAt then
         return
     end

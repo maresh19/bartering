@@ -7,5 +7,5 @@ function Bartering.addBarteringXp(player, xp)
         return
     end
 
-    player:getXp():AddXP(Perks.Bartering, xp)
+    addXp(player, Perks.Bartering, xp)
 end

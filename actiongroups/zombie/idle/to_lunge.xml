@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transition>
+	<transitionTo>lunge</transitionTo>
+	<conditions>
+		<isTrue>bLunge</isTrue>
+		<isFalse>bClient</isFalse>
+		<isFalse>Barterer</isFalse>
+	</conditions>
+</transition>

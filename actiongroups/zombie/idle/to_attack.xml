@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<transition>
+	<transitionTo>attack</transitionTo>
+	<conditions>
+		<isTrue>bAttack</isTrue>
+		<isTrue>isFacingTarget</isTrue>
+		<isFalse>bClient</isFalse>
+		<isFalse>Barterer</isFalse>
+	</conditions>
+</transition>

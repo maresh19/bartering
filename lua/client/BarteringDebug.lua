@@ -1,18 +1,19 @@
 require "Bartering"
 require "ISUI/ISInventoryPaneContextMenu"
 
-local BarteringUIUtils = require "BarteringUIUtils"
+local BarteringUIUtils = require "UI/BarteringUIUtils"
+local BarteringTiming = require "BarteringTiming"
+local print = require("BarteringPathTrace").log
 local events = _G["Events"]
 local sendClientCommand = _G["sendClientCommand"]
 local getSpecificPlayer = _G["getSpecificPlayer"]
-local getTimeInMillis = _G["getTimeInMillis"]
 local ISContextMenu = _G["ISContextMenu"]
 local ISInventoryPaneContextMenu = _G["ISInventoryPaneContextMenu"]
 
 BarteringDebug = {}
 
 function Bartering.requestDebugBartererSpawn(player, bartererId)
-    Bartering.markBartererUnavailable(bartererId, getTimeInMillis())
+    Bartering.markBartererUnavailable(bartererId, BarteringTiming.now())
     sendClientCommand(player, "Bartering", "debugSpawnBarterer", { bartererId = bartererId })
 end
 
@@ -21,22 +22,23 @@ function Bartering.requestDebugBartererCall(player, bartererId, context)
     context:hideAndChildren()
 end
 
-function Bartering.requestDebugKillBarterer(player, bartererId)
-    sendClientCommand(player, "Bartering", "debugKillBarterer", { bartererId = bartererId })
+local function debugRequest(command)
+    return function(player, bartererId)
+        sendClientCommand(player, "Bartering", command, { bartererId = bartererId })
+    end
 end
 
-function Bartering.requestDebugZombifyBarterer(player, bartererId)
-    sendClientCommand(player, "Bartering", "debugZombifyBarterer", { bartererId = bartererId })
-end
+Bartering.requestDebugKillBarterer = debugRequest("debugKillBarterer")
+Bartering.requestDebugZombifyBarterer = debugRequest("debugZombifyBarterer")
+Bartering.requestDebugAddRelations = debugRequest("addRelations")
+Bartering.requestDebugPlayBandageAnimation = debugRequest("debugBandageBarterer")
+Bartering.requestDebugHurtBarterer = debugRequest("debugHurtBarterer")
+Bartering.requestDebugResetQuest = debugRequest("debugResetQuest")
 
 function Bartering.requestDebugMeetAllBarterers(player)
     for _, barterer in pairs(Bartering.Barterers) do
         Bartering.meetBarterer(player, barterer.id)
     end
-end
-
-function Bartering.requestDebugAddRelations(player, bartererId)
-    sendClientCommand(player, "Bartering", "addRelations", { bartererId = bartererId })
 end
 
 function BarteringDebug.addCallMenuOptions(parentMenu, player, bartererId, context)
@@ -47,26 +49,9 @@ function BarteringDebug.addCallMenuOptions(parentMenu, player, bartererId, conte
         "Debug only: trigger a normal radio call path and bypass call requirements/cooldowns")
 end
 
-function Bartering.requestDebugPlayBandageAnimation(player, bartererId)
-    sendClientCommand(player, "Bartering", "debugBandageBarterer", { bartererId = bartererId })
-end
-
-function Bartering.requestDebugHurtBarterer(player, bartererId)
-    sendClientCommand(player, "Bartering", "debugHurtBarterer", { bartererId = bartererId })
-end
-
 function Bartering.requestDebugTeleportToQuest(player, bartererId)
     local quest = Bartering.Quests.getActive(player, bartererId)
-    player:setX(quest.x + 0.5)
-    player:setY(quest.y + 0.5)
-    player:setZ(quest.z)
-    player:setLx(quest.x + 0.5)
-    player:setLy(quest.y + 0.5)
-    player:setLz(quest.z)
-end
-
-function Bartering.requestDebugResetQuest(player, bartererId)
-    sendClientCommand(player, "Bartering", "debugResetQuest", { bartererId = bartererId })
+    player:teleportTo(quest.x + 0.5, quest.y + 0.5, quest.z)
 end
 
 function BarteringDebug.addBartererMenuOptions(parentMenu, context, player, bartererId)
@@ -85,7 +70,7 @@ function BarteringDebug.addBartererMenuOptions(parentMenu, context, player, bart
     local teleportOption = debugMenu:addOption("Teleport to Quest Goal", player, Bartering.requestDebugTeleportToQuest, bartererId)
     if quest then
         BarteringUIUtils.addContextTooltip(teleportOption, string.format("%s - %s in %s (%d, %d, %d)",
-            quest.itemName, Bartering.Quests.getPlaceReference(quest), quest.townName, quest.x, quest.y, quest.z))
+            quest.itemName, Bartering.Quests.getPlaceReference(quest, player), quest.townName, quest.x, quest.y, quest.z))
     else
         teleportOption.notAvailable = true
         BarteringUIUtils.addContextTooltip(teleportOption, "No active quest for this barterer")
@@ -139,6 +124,20 @@ local function onResolveNamedZs(worldobjects, playerIndex)
     sendClientCommand(player, "Bartering", "dumpNamedZs", {})
 end
 
+local function perBartererSubmenu(context, submenu, worldobjects, playerIndex, label, handler, tooltip)
+    local parent = submenu:addOption(label, worldobjects, nil)
+    local menu = ISContextMenu:getNew(context)
+    submenu:addSubMenu(parent, menu)
+
+    for _, barterer in pairs(Bartering.Barterers) do
+        local option = menu:addOption(Bartering.getBartererDisplayName(barterer.id),
+            worldobjects, handler, playerIndex, barterer.id)
+        if tooltip then
+            BarteringUIUtils.addContextTooltip(option, tooltip)
+        end
+    end
+end
+
 local function onFillWorldObjectContextMenu(playerIndex, context, worldobjects, test)
     if test then
         return
@@ -184,39 +183,85 @@ local function onFillWorldObjectContextMenu(playerIndex, context, worldobjects, 
 
     submenu:addOption("Despawn All Barterers", worldobjects, onDespawnAllBarterers, playerIndex)
 
-    local teleportParent = submenu:addOption("Teleport to Barterer", worldobjects, nil)
-    local teleportSubmenu = ISContextMenu:getNew(context)
-    submenu:addSubMenu(teleportParent, teleportSubmenu)
-
-    for _, barterer in pairs(Bartering.Barterers) do
-        teleportSubmenu:addOption(Bartering.getBartererDisplayName(barterer.id), worldobjects, onTeleportToBarterer, playerIndex, barterer.id)
-    end
-
-    local relationsParent = submenu:addOption("Add 100 Relations", worldobjects, nil)
-    local relationsSubmenu = ISContextMenu:getNew(context)
-    submenu:addSubMenu(relationsParent, relationsSubmenu)
-
-    for _, barterer in pairs(Bartering.Barterers) do
-        BarteringUIUtils.addContextTooltip(
-            relationsSubmenu:addOption(Bartering.getBartererDisplayName(barterer.id), worldobjects, onAddRelations, playerIndex, barterer.id),
-            "Debug only: add 100 relationship points with this barterer")
-    end
-
-    local saleParent = submenu:addOption("Trigger Sale", worldobjects, nil)
-    local saleSubmenu = ISContextMenu:getNew(context)
-    submenu:addSubMenu(saleParent, saleSubmenu)
-
-    for _, barterer in pairs(Bartering.Barterers) do
-        BarteringUIUtils.addContextTooltip(
-            saleSubmenu:addOption(Bartering.getBartererDisplayName(barterer.id), worldobjects, onTriggerSale, playerIndex, barterer.id),
-            "Debug only: force this barterer's sale active for the rest of today")
-    end
+    perBartererSubmenu(context, submenu, worldobjects, playerIndex, "Teleport to Barterer", onTeleportToBarterer)
+    perBartererSubmenu(context, submenu, worldobjects, playerIndex, "Add 100 Relations", onAddRelations,
+        "Debug only: add 100 relationship points with this barterer")
+perBartererSubmenu(context, submenu, worldobjects, playerIndex, "Trigger Sale", onTriggerSale,
+        "Debug only: force this barterer's sale active for today")
 
     submenu:addOption("Dump Named Place Rooms", worldobjects, onResolveNamedZs, playerIndex)
 
     BarteringUIUtils.addContextTooltip(
         submenu:addOption("Dump Path Trace", worldobjects, onDumpPathTrace, playerIndex),
         "Debug only: print the accumulated pathing decision counters for every loaded barterer and reset the window")
+end
+
+local tracedBarterers = {}
+
+local function logBartererDebug(zombie, reason, bartererState, actionState)
+    local name = Bartering.getBartererDisplayName(zombie:getVariableString("BartererId"))
+    print(string.format(
+        "[Bartering][ClientDebug] %s | %s | state=%s action=%s curState=%s useless=%s walk=%s bump=%s bumpDone=%s pos=%.2f,%.2f,%.2f | separate=%s solid=%s collidable=%s floor=%s ragdoll=%s sitWall=%s speedType=%s",
+        tostring(name),
+        tostring(reason),
+        tostring(bartererState),
+        tostring(actionState),
+        tostring(zombie:getCurrentStateName()),
+        tostring(zombie:isUseless()),
+        tostring(zombie:getVariableString("BartererWalkType")),
+        tostring(zombie:getBumpType()),
+        tostring(zombie:getVariableBoolean("BumpAnimFinished")),
+        zombie:getX(),
+        zombie:getY(),
+        zombie:getZ(),
+        tostring(zombie:isSolidForSeparate()),
+        tostring(zombie:isSolid()),
+        tostring(zombie:isCollidable()),
+        tostring(zombie:isOnFloor()),
+        tostring(zombie:isRagdoll()),
+        tostring(zombie:isSitAgainstWall()),
+        tostring(zombie:getSpeedType())
+    ))
+end
+
+function BarteringDebug.forgetBarterer(bartererId)
+    tracedBarterers[bartererId] = nil
+end
+
+function BarteringDebug.traceBarterer(zombie, bartererState)
+    local bartererId = zombie:getVariableString("BartererId")
+    local entry = tracedBarterers[bartererId]
+    if not entry then
+        entry = {}
+        tracedBarterers[bartererId] = entry
+    end
+    local actionState = zombie:getActionStateName()
+
+    if entry.lastBartererState ~= bartererState then
+        if bartererState == "Return" then
+            print(string.format(
+                "[Bartering][VisualState] %s raw state -> Return | pos=%.1f,%.1f calledIn=%s liveTrip=%s awayFromHome=%s returnKnowledge=%s",
+                tostring(bartererId), zombie:getX(), zombie:getY(),
+                tostring(zombie:getVariableBoolean("BartererCalledIn")),
+                tostring(Bartering.Trips[bartererId] ~= nil),
+                tostring(Bartering.isBartererAwayFromHome(bartererId)),
+                tostring(Bartering.hasReturningHomeKnowledge(getSpecificPlayer(0), bartererId))))
+        end
+        logBartererDebug(zombie, "state changed", bartererState, actionState)
+        entry.lastBartererState = bartererState
+    end
+    if entry.lastActionState ~= actionState then
+        logBartererDebug(zombie, "action changed", bartererState, actionState)
+        entry.lastActionState = actionState
+    end
+    if bartererState == "Return" and actionState ~= "pathfind" and actionState ~= "walktoward" and actionState ~= "idle" then
+        if entry.lastUnexpectedActionState ~= actionState then
+            logBartererDebug(zombie, "unexpected moving action", bartererState, actionState)
+            entry.lastUnexpectedActionState = actionState
+        end
+    else
+        entry.lastUnexpectedActionState = nil
+    end
 end
 
 events.OnFillWorldObjectContextMenu.Add(onFillWorldObjectContextMenu)
