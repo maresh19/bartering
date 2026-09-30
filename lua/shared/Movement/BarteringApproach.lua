@@ -595,6 +595,7 @@ function BarteringApproach.new(deps, arriveLogic)
 
             if BarteringIntercept.isAtMeetDistance(zombie, callerX, callerY) then
                 clearGoal(zombie, "interceptMeet")
+                deps.cancelMove(zombie, "interceptMeet.moveCancelled")
                 deps.applyWaitingState(entry, zombie)
                 zombie:faceLocationF(callerX, callerY)
                 BarteringPathTrace.aiStop(zombie, "move.waiting.interceptMeet")
